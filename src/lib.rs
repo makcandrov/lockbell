@@ -18,6 +18,24 @@ use parking_lot::{
     RwLockWriteGuard,
 };
 
+/// Drop guard: decrements `locking` and notifies `locking_zero` on zero.
+/// Ensures `try_write_or_else` cannot leak the increment if the callback
+/// factory panics.
+struct LockingDec<'a>(&'a LockState);
+
+impl Drop for LockingDec<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.inner.lock();
+        inner.locking -= 1;
+        if inner.locking == 0 {
+            // notify_all: read- and write-drains can wait concurrently — a
+            // reader releases its lock before locking state, so a writer can
+            // slip in. notify_one would strand the loser.
+            self.0.locking_zero.notify_all();
+        }
+    }
+}
+
 #[derive(Default)]
 struct Inner {
     dropping: bool,
@@ -214,23 +232,21 @@ impl<T> RwLockBell<T> {
         #[cfg(test)]
         hooks::run(hooks::HookPoint::TryWriteOrBeforeAcquire);
 
+        // `LockingDec`'s Drop performs the decrement and notify_all.
+        let _dec = LockingDec(&self.state);
+
         if let Some(guard) = self.lock.try_write() {
-            let mut inner = self.state.inner.lock();
-            inner.locking -= 1;
-            if inner.locking == 0 {
-                self.state.locking_zero.notify_one();
-            }
             Some(RwLockBellWriteGuard {
                 guard: Some(guard),
                 state: &self.state,
             })
         } else {
-            let mut inner = self.state.inner.lock();
-            inner.callbacks.push(Box::new(callback()));
-            inner.locking -= 1;
-            if inner.locking == 0 {
-                self.state.locking_zero.notify_one();
-            }
+            // Build the callback box *before* re-acquiring `inner`, and arm a
+            // drop guard so that `locking` is decremented even if `callback()`
+            // or `Box::new` panics. Without this, a panicking factory would
+            // leak the increment and permanently deadlock future drains.
+            let cb: Box<dyn FnOnce() + Send> = Box::new(callback());
+            self.state.inner.lock().callbacks.push(cb);
             None
         }
     }
@@ -602,6 +618,14 @@ fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
     });
 
     if let Some(payload) = first_panic {
-        panic::resume_unwind(payload);
+        // If we are already unwinding from an outer panic (the guard was
+        // dropped as part of stack-unwinding), re-raising would trigger a
+        // double-panic and abort the process. Suppress the callback panic
+        // in that case — the outer panic carries the primary failure.
+        if std::thread::panicking() {
+            drop(payload);
+        } else {
+            panic::resume_unwind(payload);
+        }
     }
 }

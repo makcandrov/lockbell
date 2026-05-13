@@ -6,6 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     thread,
+    time::Duration,
 };
 
 use lockbell::RwLockBell;
@@ -141,4 +142,142 @@ fn test_callback_sees_updated_value() {
     drop(guard);
 
     assert_eq!(seen.load(Relaxed), 99);
+}
+
+/// Spawns a watchdog that aborts the process if `stop` isn't set within `dur`.
+/// Returns the watchdog handle and the stop flag — caller is responsible for
+/// setting the flag and joining when its work is complete.
+///
+/// Used to flag potential deadlocks in tests for guards that are `!Send` and
+/// therefore can't be dropped from a side thread.
+fn spawn_watchdog(label: &'static str, dur: Duration) -> (thread::JoinHandle<()>, Arc<AtomicBool>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = stop.clone();
+    let watchdog = thread::spawn(move || {
+        let step = Duration::from_millis(50);
+        let mut waited = Duration::ZERO;
+        while waited < dur {
+            if stop2.load(Relaxed) {
+                return;
+            }
+            thread::sleep(step);
+            waited += step;
+        }
+        eprintln!("[{label}] WATCHDOG fired — deadlock regression");
+        std::process::abort();
+    });
+    (watchdog, stop)
+}
+
+/// Regression for the `try_write_or_else` factory-panic bug.
+///
+/// Previously, the factory was invoked between `locking += 1` and
+/// `locking -= 1` while holding the state mutex. A panic from the factory
+/// unwound out of the function without decrementing `locking`, permanently
+/// breaking the lock — any subsequent guard drop would hang in
+/// `while inner.locking != 0`.
+///
+/// The fix uses a drop guard so `locking` is always decremented, even on
+/// unwind. This test verifies that after a panicking factory the lock is
+/// fully usable.
+#[test]
+fn regression_try_write_or_else_factory_panic_does_not_leak_locking() {
+    let lock = Arc::new(RwLockBell::new(0u64));
+
+    // Hold a write guard so try_write_or_else takes the failure path.
+    let guard = lock.write();
+
+    // Panicking factory; catch the panic.
+    let lock2 = lock.clone();
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = lock2.try_write_or_else(|| -> fn() {
+            panic!("factory panic");
+        });
+    }));
+    assert!(result.is_err(), "factory panic must propagate to caller");
+
+    // Bounded watchdog: with the bug, drop(guard) hangs forever. The guard
+    // is `!Send`, so we have to drop it on this thread and use a watchdog
+    // thread to flag the hang.
+    let (watchdog, stop) = spawn_watchdog(
+        "regression_try_write_or_else_factory_panic_does_not_leak_locking",
+        Duration::from_secs(5),
+    );
+    drop(guard);
+    stop.store(true, Relaxed);
+    watchdog.join().unwrap();
+
+    // The lock must still be fully usable.
+    let mut w = lock.write();
+    *w = 42;
+    drop(w);
+    assert_eq!(*lock.read(), 42);
+
+    // And try_write_or must still queue + fire callbacks normally.
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired2 = fired.clone();
+    let w = lock.write();
+    assert!(
+        lock.try_write_or(move || fired2.store(true, Relaxed))
+            .is_none()
+    );
+    drop(w);
+    assert!(fired.load(Relaxed));
+}
+
+/// Regression for the double-panic abort during a guard's drop.
+///
+/// If a user panic is already unwinding the stack and a write guard's drop
+/// runs a callback that itself panics, re-raising the callback panic in the
+/// middle of an active unwind triggers a process abort. The fix suppresses
+/// the inner re-raise via `std::thread::panicking()`.
+///
+/// This test panics the user code while a guard is alive and a panicking
+/// callback is queued; the outer panic must propagate (be caught by
+/// `catch_unwind`) without aborting the process.
+#[test]
+fn regression_no_abort_when_callback_panics_during_user_unwind() {
+    let lock = Arc::new(RwLockBell::new(0u64));
+
+    let lock2 = lock.clone();
+    let result = panic::catch_unwind(AssertUnwindSafe(move || {
+        let _guard = lock2.write();
+        let _ = lock2.try_write_or(|| panic!("callback panic during unwind"));
+        // _guard is dropped as part of unwinding from this panic. The drop
+        // fires the queued callback, which panics. Without the fix the
+        // double-panic aborts the process and this test never returns.
+        panic!("outer user panic");
+    }));
+
+    assert!(result.is_err(), "outer panic must propagate");
+
+    // Lock must still be in a usable, consistent state.
+    let r = lock.read();
+    assert_eq!(*r, 0);
+    drop(r);
+
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired2 = fired.clone();
+    let w = lock.write();
+    assert!(
+        lock.try_write_or(move || fired2.store(true, Relaxed))
+            .is_none()
+    );
+    drop(w);
+    assert!(fired.load(Relaxed));
+}
+
+/// Sanity check: with no outer panic, a callback panic still propagates
+/// (we only suppress when an outer unwind is already in progress).
+#[test]
+fn callback_panic_still_propagates_when_no_outer_panic() {
+    let lock = Arc::new(RwLockBell::new(0u64));
+    let guard = lock.write();
+    let _ = lock.try_write_or(|| panic!("callback panic"));
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| drop(guard)));
+    assert!(
+        result.is_err(),
+        "callback panic must still propagate in normal flow"
+    );
 }

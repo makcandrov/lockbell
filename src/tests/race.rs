@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering::Relaxed},
     },
     thread,
+    time::Duration,
 };
 
 use crate::{
@@ -444,4 +445,120 @@ fn test_callbacks_run_after_dropping_is_reset() {
     drop(guard); // DrainBeforeCallbacks hook fires, then callback runs
 
     assert!(callback_ran.load(Relaxed));
+}
+
+// ─── regression: read-drain + write-drain both waiting on locking_zero ────────
+
+/// Regression for the double-drain deadlock.
+///
+/// Previously, both drain paths slept on `locking_zero` and the failure path
+/// of `try_write_or_else` called `notify_one`, stranding the second waiter.
+/// The fix is to `notify_all` so both drainers re-check `locking == 0`.
+///
+/// Scenario:
+/// 1. Q queues a callback while R holds a read guard. callbacks=[CB], locking=0.
+/// 2. T calls try_write_or, pauses at TryWriteOrBeforeAcquire with locking=1.
+/// 3. Main drops R; inside drop_read_guard the
+///    `ReadGuardAfterSettingDropping` hook signals `r_set` (dropping=true set,
+///    locking_zero wait not yet started). Main then sleeps on locking_zero.
+/// 4. Orchestrator (in its own thread) waits for r_set, then spawns W.
+/// 5. W acquires the write lock and drops it; inside drop_write_guard the
+///    `WriteGuardAfterSettingDropping` hook signals `w_set` (dropping=true
+///    re-set, locking_zero wait not yet started). W then sleeps on locking_zero.
+/// 6. Orchestrator waits for w_set, then releases T.
+/// 7. T's try_write fails (W holds the write lock), T pushes its CB,
+///    decrements locking to 0, and *with the fix* notify_all wakes both
+///    drainers. Without the fix, only one would wake and the other would hang.
+#[test]
+fn regression_double_drain_no_deadlock() {
+    let _g = TestGuard::acquire();
+    let lock = Arc::new(RwLockBell::new(0u64));
+
+    // Step 1: R holds the read lock; Q queues CB.
+    let r = lock.read();
+    let q_fired = Arc::new(AtomicBool::new(false));
+    let qf2 = q_fired.clone();
+    assert!(
+        lock.try_write_or(move || qf2.store(true, Relaxed))
+            .is_none()
+    );
+
+    // Step 2: pause T at TryWriteOrBeforeAcquire (locking=1).
+    let gate_t = Gate::new();
+    let gt2 = gate_t.clone();
+    hooks::set(HookPoint::TryWriteOrBeforeAcquire, move || gt2.wait());
+
+    let lock_t = lock.clone();
+    let t_fired = Arc::new(AtomicBool::new(false));
+    let tf2 = t_fired.clone();
+    let t_handle = thread::spawn(move || {
+        let _ = lock_t.try_write_or(move || tf2.store(true, Relaxed));
+    });
+    gate_t.wait_for_arrival();
+    hooks::clear(HookPoint::TryWriteOrBeforeAcquire);
+
+    // Step 3 hook: signal when R sets dropping=true.
+    let r_set = Gate::new();
+    let r_set2 = r_set.clone();
+    hooks::set(HookPoint::ReadGuardAfterSettingDropping, move || {
+        hooks::clear(HookPoint::ReadGuardAfterSettingDropping);
+        r_set2.signal();
+    });
+
+    // Step 5 hook: signal when W sets dropping=true.
+    let w_set = Gate::new();
+    let w_set2 = w_set.clone();
+    hooks::set(HookPoint::WriteGuardAfterSettingDropping, move || {
+        hooks::clear(HookPoint::WriteGuardAfterSettingDropping);
+        w_set2.signal();
+    });
+
+    // Step 4 + 6: orchestrator spawns W after R's signal, releases T after W's.
+    let lock_orc = lock.clone();
+    let gate_t_open = gate_t.clone();
+    let r_set_arrival = r_set.clone();
+    let w_set_arrival = w_set.clone();
+    let orchestrator = thread::spawn(move || {
+        r_set_arrival.wait_for_arrival();
+
+        let lock_w = lock_orc.clone();
+        let w_handle = thread::spawn(move || {
+            let w = lock_w.write();
+            drop(w);
+        });
+
+        w_set_arrival.wait_for_arrival();
+        gate_t_open.open();
+
+        w_handle.join().unwrap();
+    });
+
+    // Watchdog so a regression doesn't hang the test runner forever.
+    let watchdog_stop = Arc::new(AtomicBool::new(false));
+    let watchdog_stop2 = watchdog_stop.clone();
+    let watchdog = thread::spawn(move || {
+        for _ in 0..50 {
+            if watchdog_stop2.load(Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("[regression_double_drain_no_deadlock] WATCHDOG fired");
+        std::process::abort();
+    });
+
+    // Main drops R; with the fix this returns once T's notify_all wakes both
+    // drainers and they finish their drains.
+    drop(r);
+
+    t_handle.join().unwrap();
+    orchestrator.join().unwrap();
+
+    // Both queued callbacks must have fired (Q's pre-existing one, plus T's
+    // newly-queued one).
+    assert!(q_fired.load(Relaxed), "Q's callback must fire");
+    assert!(t_fired.load(Relaxed), "T's callback must fire");
+
+    watchdog_stop.store(true, Relaxed);
+    watchdog.join().unwrap();
 }
