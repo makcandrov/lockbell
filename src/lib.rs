@@ -18,26 +18,8 @@ use parking_lot::{
     RwLockWriteGuard,
 };
 
-/// Drop guard: decrements `locking` and notifies `locking_zero` on zero.
-/// Ensures `try_write_or_else` cannot leak the increment if the callback
-/// factory panics.
-struct LockingDec<'a>(&'a LockState);
-
-impl Drop for LockingDec<'_> {
-    fn drop(&mut self) {
-        let mut inner = self.0.inner.lock();
-        inner.locking -= 1;
-        if inner.locking == 0 {
-            // notify_all: read- and write-drains can wait concurrently — a
-            // reader releases its lock before locking state, so a writer can
-            // slip in. notify_one would strand the loser.
-            self.0.locking_zero.notify_all();
-        }
-    }
-}
-
 #[derive(Default)]
-struct Inner {
+struct LockStateInner {
     dropping: bool,
     locking: u64,
     /// Number of live [`RwLockBellReadGuard`] instances.
@@ -45,7 +27,19 @@ struct Inner {
     callbacks: Vec<Box<dyn FnOnce() + Send>>,
 }
 
-impl Debug for Inner {
+impl LockStateInner {
+    pub fn decrement_locking(&mut self, locking_zero: &Condvar) {
+        self.locking -= 1;
+        if self.locking == 0 {
+            // notify_all: read- and write-drains can wait concurrently — a
+            // reader releases its lock before locking state, so a writer can
+            // slip in. notify_one would strand the loser.
+            locking_zero.notify_all();
+        }
+    }
+}
+
+impl Debug for LockStateInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
             .field("dropping", &self.dropping)
@@ -58,7 +52,7 @@ impl Debug for Inner {
 
 #[derive(Default)]
 struct LockState {
-    inner: Mutex<Inner>,
+    inner: Mutex<LockStateInner>,
     /// Notified when `locking` reaches zero (dropper is waiting on this).
     locking_zero: Condvar,
     /// Notified when `dropping` becomes false (try_write callers wait on this).
@@ -74,6 +68,12 @@ impl Debug for LockState {
                 .field("inner", &"<locked>")
                 .finish(),
         }
+    }
+}
+
+impl LockState {
+    fn decrement_locking(&self) {
+        self.inner.lock().decrement_locking(&self.locking_zero);
     }
 }
 
@@ -232,21 +232,22 @@ impl<T> RwLockBell<T> {
         #[cfg(test)]
         hooks::run(hooks::HookPoint::TryWriteOrBeforeAcquire);
 
-        // `LockingDec`'s Drop performs the decrement and notify_all.
-        let _dec = LockingDec(&self.state);
-
         if let Some(guard) = self.lock.try_write() {
+            self.state.decrement_locking();
             Some(RwLockBellWriteGuard {
                 guard: Some(guard),
                 state: &self.state,
             })
         } else {
-            // Build the callback box *before* re-acquiring `inner`, and arm a
-            // drop guard so that `locking` is decremented even if `callback()`
-            // or `Box::new` panics. Without this, a panicking factory would
-            // leak the increment and permanently deadlock future drains.
-            let cb: Box<dyn FnOnce() + Send> = Box::new(callback());
-            self.state.inner.lock().callbacks.push(cb);
+            // `decrement_locking` must be called eve if the callback factory panics
+            let cb = catch_panic(callback, || self.state.decrement_locking());
+
+            let cb: Box<dyn FnOnce() + Send> = Box::new(cb);
+
+            let mut inner = self.state.inner.lock();
+            inner.callbacks.push(cb);
+            inner.decrement_locking(&self.state.locking_zero);
+            drop(inner);
             None
         }
     }
@@ -628,4 +629,18 @@ fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
             panic::resume_unwind(payload);
         }
     }
+}
+
+fn catch_panic<T>(f: impl FnOnce() -> T, on_panic: impl FnOnce()) -> T {
+    struct Guard<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            self.0.take().unwrap()()
+        }
+    }
+
+    let guard = Guard(Some(on_panic));
+    let res = f();
+    forget(guard);
+    res
 }
