@@ -1,6 +1,9 @@
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering::Relaxed},
+use std::{
+    panic::{self, AssertUnwindSafe},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
 };
 
 use lockbell::RwLockBell;
@@ -177,4 +180,181 @@ fn test_try_map_err_write_guard_failure() {
     let (original, err) = result.unwrap_err();
     assert_eq!(err, "oops");
     assert_eq!(*original, (1, 2));
+}
+
+// ─── panic safety regressions ────────────────────────────────────────────────
+//
+// These verify that a panic in the user-supplied projection closure does not
+// corrupt the lock's internal state.
+//
+// Today, every `map`-family method does:
+//
+//     let guard = self.guard.take().unwrap();
+//     forget(self);
+//     // (release of state bookkeeping is the responsibility of the *new* mapped
+//     //  guard, which is only ever constructed if `f` returns successfully)
+//     let mapped = RwLockReadGuard::map(guard, f);   // f may panic here
+//
+// If `f` panics, parking_lot's `map` drops its `s` parameter (releasing the
+// underlying lock) but we never build the mapped guard, so:
+//   - read side : `state.readers` is permanently leaked → the read-drop drain
+//                 path can never reach `readers == 0` again → callbacks queued
+//                 via `try_write_or` may stop firing forever.
+//   - write side: the write-drop drain is skipped entirely → callbacks queued
+//                 while this write guard was held are not flushed, even though
+//                 the lock has actually been released.
+
+// ─── read side: panic must not leak the `state.readers` counter ──────────────
+
+#[test]
+fn regression_read_map_panic_does_not_leak_readers() {
+    let lock = Arc::new(RwLockBell::new((1u64, 2u64)));
+
+    let r = lock.read();
+    let result = panic::catch_unwind(AssertUnwindSafe(move || {
+        let _ = r.map(|_| -> &u64 { panic!("intentional panic in map closure") });
+    }));
+    assert!(result.is_err(), "panic must propagate to caller");
+
+    // If `state.readers` was leaked, the next read-guard drop will see
+    // `readers > 0` and bail without draining — even though no other reader
+    // exists.
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let r2 = lock.read();
+    assert!(
+        lock.try_write_or(move || called2.store(true, Relaxed))
+            .is_none()
+    );
+    drop(r2);
+    assert!(
+        called.load(Relaxed),
+        "callback must fire when the last read guard drops; \
+         state.readers must not have been leaked by the panic"
+    );
+}
+
+#[test]
+fn regression_read_try_map_panic_does_not_leak_readers() {
+    let lock = Arc::new(RwLockBell::new((1u64, 2u64)));
+
+    let r = lock.read();
+    let result = panic::catch_unwind(AssertUnwindSafe(move || {
+        let _ = r.try_map(|_| -> Option<&u64> { panic!("intentional") });
+    }));
+    assert!(result.is_err());
+
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let r2 = lock.read();
+    assert!(
+        lock.try_write_or(move || called2.store(true, Relaxed))
+            .is_none()
+    );
+    drop(r2);
+    assert!(
+        called.load(Relaxed),
+        "callback must fire after last read drops"
+    );
+}
+
+#[test]
+fn regression_read_try_map_or_err_panic_does_not_leak_readers() {
+    let lock = Arc::new(RwLockBell::new((1u64, 2u64)));
+
+    let r = lock.read();
+    let result = panic::catch_unwind(AssertUnwindSafe(move || {
+        let _ = r.try_map_or_err(|_| -> Result<&u64, ()> { panic!("intentional") });
+    }));
+    assert!(result.is_err());
+
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let r2 = lock.read();
+    assert!(
+        lock.try_write_or(move || called2.store(true, Relaxed))
+            .is_none()
+    );
+    drop(r2);
+    assert!(
+        called.load(Relaxed),
+        "callback must fire after last read drops"
+    );
+}
+
+// ─── write side: panic must still drain pending callbacks ────────────────────
+
+#[test]
+fn regression_write_map_panic_drains_pending_callbacks() {
+    let lock = Arc::new(RwLockBell::new((1u64, 2u64)));
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let w = lock.write();
+    assert!(
+        lock.try_write_or(move || called2.store(true, Relaxed))
+            .is_none()
+    );
+
+    let result = panic::catch_unwind(AssertUnwindSafe(move || {
+        let _ = w.map(|_| -> &mut u64 { panic!("intentional") });
+    }));
+    assert!(result.is_err());
+
+    // The parking_lot write lock was released as part of the unwind, so
+    // contention has cleared — the queued callback must have fired.
+    assert!(
+        called.load(Relaxed),
+        "callbacks queued under the panicked write guard must be drained \
+         when the lock is released"
+    );
+}
+
+#[test]
+fn regression_write_try_map_panic_drains_pending_callbacks() {
+    let lock = Arc::new(RwLockBell::new((1u64, 2u64)));
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let w = lock.write();
+    assert!(
+        lock.try_write_or(move || called2.store(true, Relaxed))
+            .is_none()
+    );
+
+    let result = panic::catch_unwind(AssertUnwindSafe(move || {
+        let _ = w.try_map(|_| -> Option<&mut u64> { panic!("intentional") });
+    }));
+    assert!(result.is_err());
+
+    assert!(
+        called.load(Relaxed),
+        "queued callback must fire after the write guard's lock is released by unwind"
+    );
+}
+
+#[test]
+fn regression_write_try_map_err_panic_drains_pending_callbacks() {
+    let lock = Arc::new(RwLockBell::new((1u64, 2u64)));
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let w = lock.write();
+    assert!(
+        lock.try_write_or(move || called2.store(true, Relaxed))
+            .is_none()
+    );
+
+    let result = panic::catch_unwind(AssertUnwindSafe(move || {
+        let _ = w.try_map_err(|_| -> Result<&mut u64, ()> { panic!("intentional") });
+    }));
+    assert!(result.is_err());
+
+    assert!(
+        called.load(Relaxed),
+        "queued callback must fire after the write guard's lock is released by unwind"
+    );
 }

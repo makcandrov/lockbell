@@ -299,8 +299,8 @@ impl<'a, T> RwLockBellReadGuard<'a, T> {
     {
         let guard = self.guard.take().unwrap();
         let state = self.state;
-        forget(self);
         let map_guard = RwLockReadGuard::map(guard, f);
+        forget(self);
         MappedRwLockBellReadGuard {
             guard: Some(map_guard),
             state,
@@ -316,8 +316,9 @@ impl<'a, T> RwLockBellReadGuard<'a, T> {
     {
         let guard = self.guard.take().unwrap();
         let state = self.state;
+        let map_res = RwLockReadGuard::try_map(guard, f);
         forget(self);
-        match RwLockReadGuard::try_map(guard, f) {
+        match map_res {
             Ok(map_guard) => Ok(MappedRwLockBellReadGuard {
                 guard: Some(map_guard),
                 state,
@@ -342,8 +343,9 @@ impl<'a, T> RwLockBellReadGuard<'a, T> {
     {
         let guard = self.guard.take().unwrap();
         let state = self.state;
+        let map_res = RwLockReadGuard::try_map_or_err(guard, f);
         forget(self);
-        match RwLockReadGuard::try_map_or_err(guard, f) {
+        match map_res {
             Ok(map_guard) => Ok(MappedRwLockBellReadGuard {
                 guard: Some(map_guard),
                 state,
@@ -423,8 +425,9 @@ impl<'a, T> RwLockBellWriteGuard<'a, T> {
     {
         let guard = self.guard.take().unwrap();
         let state = self.state;
-        forget(self);
+
         let map_guard = RwLockWriteGuard::map(guard, f);
+        forget(self);
         MappedRwLockBellWriteGuard {
             guard: Some(map_guard),
             state,
@@ -440,8 +443,9 @@ impl<'a, T> RwLockBellWriteGuard<'a, T> {
     {
         let guard = self.guard.take().unwrap();
         let state = self.state;
+        let map_res = RwLockWriteGuard::try_map(guard, f);
         forget(self);
-        match RwLockWriteGuard::try_map(guard, f) {
+        match map_res {
             Ok(map_guard) => Ok(MappedRwLockBellWriteGuard {
                 guard: Some(map_guard),
                 state,
@@ -466,8 +470,9 @@ impl<'a, T> RwLockBellWriteGuard<'a, T> {
     {
         let guard = self.guard.take().unwrap();
         let state = self.state;
+        let map_res = RwLockWriteGuard::try_map_or_err(guard, f);
         forget(self);
-        match RwLockWriteGuard::try_map_or_err(guard, f) {
+        match map_res {
             Ok(map_guard) => Ok(MappedRwLockBellWriteGuard {
                 guard: Some(map_guard),
                 state,
@@ -586,7 +591,8 @@ fn drop_write_guard<G>(guard: &mut Option<G>, state: &LockState) {
         // Mutex released here — callbacks execute without holding any lock.
     };
 
-    drop(guard.take().unwrap());
+    // Can be None if the map method panicked.
+    drop(guard.take());
 
     drain_and_run(state, callbacks);
 }
