@@ -20,10 +20,13 @@ use parking_lot::{
 
 #[derive(Default)]
 struct LockStateInner {
+    /// A drain is in progress (between setting the flag and flushing callbacks).
     dropping: bool,
+    /// In-flight `try_write_or_else` calls between bumping the counter and resolving.
     locking: u64,
-    /// Number of live [`RwLockBellReadGuard`] instances.
+    /// Live `RwLockBellReadGuard` count.
     readers: u64,
+    /// Callbacks queued by failed `try_write_or` calls, FIFO order.
     callbacks: Vec<Box<dyn FnOnce() + Send>>,
 }
 
@@ -31,9 +34,8 @@ impl LockStateInner {
     pub fn decrement_locking(&mut self, locking_zero: &Condvar) {
         self.locking -= 1;
         if self.locking == 0 {
-            // notify_all: read- and write-drains can wait concurrently — a
-            // reader releases its lock before locking state, so a writer can
-            // slip in. notify_one would strand the loser.
+            // `notify_all`: a read-drain and a write-drain can both wait on
+            // `locking_zero` concurrently; `notify_one` would strand one of them.
             locking_zero.notify_all();
         }
     }
@@ -53,9 +55,9 @@ impl Debug for LockStateInner {
 #[derive(Default)]
 struct LockState {
     inner: Mutex<LockStateInner>,
-    /// Notified when `locking` reaches zero (dropper is waiting on this).
+    /// Signalled when `locking` reaches 0; drainers wait on this.
     locking_zero: Condvar,
-    /// Notified when `dropping` becomes false (try_write callers wait on this).
+    /// Signalled when `dropping` flips back to `false`; `try_write_or_else` waits on this.
     not_dropping: Condvar,
 }
 
@@ -77,11 +79,11 @@ impl LockState {
     }
 }
 
-/// An [`RwLock`] wrapper that fires registered callbacks when a write guard is released.
+/// An [`RwLock`] that fires queued callbacks when contention clears.
 ///
-/// When [`try_write_or`] cannot acquire the lock, the provided callback is queued.
-/// All queued callbacks are called in FIFO order, without holding any lock, when the
-/// next write guard is dropped.
+/// When [`try_write_or`] cannot acquire the lock, the supplied callback is queued.
+/// All queued callbacks fire in FIFO order, without holding any lock, when the
+/// next write guard (or last reader) is dropped.
 ///
 /// [`try_write_or`]: RwLockBell::try_write_or
 #[derive(Debug)]
@@ -110,17 +112,17 @@ impl<T> RwLockBell<T> {
 
     /// Consumes the lock and returns the inner value.
     ///
-    /// Any callbacks pending in the queue are dropped without being called.
+    /// Pending callbacks are dropped without being called.
     #[inline]
     #[must_use]
     pub fn into_inner(self) -> T {
         self.lock.into_inner()
     }
 
-    /// Locks for shared read access, blocking until it can be acquired.
+    /// Locks for shared read access, blocking until acquired.
     ///
-    /// When the returned guard is dropped, any pending callbacks registered via
-    /// [`try_write_or`] are flushed if this was the last reader holding the lock.
+    /// Dropping the guard flushes pending [`try_write_or`] callbacks if this was
+    /// the last active reader.
     ///
     /// [`try_write_or`]: RwLockBell::try_write_or
     #[must_use]
@@ -146,10 +148,10 @@ impl<T> RwLockBell<T> {
         })
     }
 
-    /// Locks for exclusive write access, blocking until it can be acquired.
+    /// Locks for exclusive write access, blocking until acquired.
     ///
-    /// Callbacks registered via [`try_write_or`] while this guard is held will be
-    /// called when the guard is dropped.
+    /// Callbacks registered via [`try_write_or`] while this guard is held fire
+    /// when the guard is dropped.
     ///
     /// [`try_write_or`]: RwLockBell::try_write_or
     #[must_use]
@@ -162,8 +164,8 @@ impl<T> RwLockBell<T> {
 
     /// Attempts to acquire exclusive write access without blocking.
     ///
-    /// Returns `None` if the lock is currently held. No callback is registered on
-    /// failure; use [`try_write_or`] to register one.
+    /// Returns `None` if the lock is held. No callback is registered on failure;
+    /// use [`try_write_or`] for that.
     ///
     /// [`try_write_or`]: RwLockBell::try_write_or
     #[must_use]
@@ -174,13 +176,13 @@ impl<T> RwLockBell<T> {
         })
     }
 
-    /// Attempts to acquire exclusive write access without blocking.
+    /// Attempts to acquire exclusive write access; on failure, queues `callback`.
     ///
-    /// - **Success** — returns `Some(guard)` and discards `callback`.
-    /// - **Failure** — queues `callback` and returns `None`. The callback will be
-    ///   called, without holding any lock, after the next write guard is dropped.
+    /// - **Success** — returns `Some(guard)`; `callback` is discarded.
+    /// - **Failure** — returns `None`; `callback` is queued and runs, without
+    ///   holding any lock, after the next write guard (or last reader) is dropped.
     ///
-    /// Callbacks are called in FIFO registration order.
+    /// Callbacks fire in FIFO registration order.
     #[inline]
     #[must_use]
     pub fn try_write_or<'a, Callback>(
@@ -193,18 +195,11 @@ impl<T> RwLockBell<T> {
         self.try_write_or_else(|| callback)
     }
 
-    /// Attempts to acquire exclusive write access without blocking, lazily constructing
-    /// the callback only if the lock is unavailable.
+    /// Like [`try_write_or`], but builds the callback lazily.
     ///
-    /// - **Success** — returns `Some(guard)` and never calls `callback`.
-    /// - **Failure** — calls `callback()` to produce the callback, queues it, and returns
-    ///   `None`. The callback will be called, without holding any lock, after the next
-    ///   write guard is dropped.
-    ///
-    /// Prefer this over [`try_write_or`] when constructing the callback is expensive
-    /// or has side effects that should only occur on failure.
-    ///
-    /// Callbacks are called in FIFO registration order.
+    /// On contention, `callback()` is called to produce the queued callback.
+    /// Prefer this when constructing the callback is expensive or has side effects
+    /// that should only run on failure.
     ///
     /// [`try_write_or`]: Self::try_write_or
     #[must_use]
@@ -215,9 +210,9 @@ impl<T> RwLockBell<T> {
     where
         Callback: FnOnce() + Send + 'static,
     {
-        // Atomically wait until not dropping, then increment locking.
-        // Both steps happen under the same mutex, which eliminates the TOCTOU
-        // that required SeqCst atomic ordering in the spin-based version.
+        // Wait while a drain is running, then bump `locking` — both under the
+        // same mutex so the `dropping` view can't go stale between the check
+        // and the increment.
         let mut inner = self.state.inner.lock();
 
         while inner.dropping {
@@ -239,7 +234,8 @@ impl<T> RwLockBell<T> {
                 state: &self.state,
             })
         } else {
-            // `decrement_locking` must be called eve if the callback factory panics
+            // Decrement `locking` even if the factory panics — otherwise
+            // drainers would wait on `locking_zero` forever.
             let cb = catch_panic(callback, || self.state.decrement_locking());
 
             let cb: Box<dyn FnOnce() + Send> = Box::new(cb);
@@ -247,7 +243,6 @@ impl<T> RwLockBell<T> {
             let mut inner = self.state.inner.lock();
             inner.callbacks.push(cb);
             inner.decrement_locking(&self.state.locking_zero);
-            drop(inner);
             None
         }
     }
@@ -276,12 +271,11 @@ impl<T> From<RwLockBell<T>> for RwLock<T> {
 
 /// RAII read guard for [`RwLockBell`].
 ///
-/// Provides shared read access to the protected value via [`Deref`].
-/// When dropped, releases the read lock and, if this was the last active
-/// read guard, immediately flushes any pending callbacks that were registered
-/// via [`try_write_or`].
+/// Provides shared read access via [`Deref`]. Dropping releases the read lock
+/// and, if this was the last active reader, flushes pending [`try_write_or`]
+/// callbacks.
 ///
-/// Obtained via [`RwLockBell::read`] or [`RwLockBell::try_read`].
+/// Returned by [`RwLockBell::read`] and [`RwLockBell::try_read`].
 ///
 /// [`try_write_or`]: RwLockBell::try_write_or
 #[derive(Debug)]
@@ -291,8 +285,7 @@ pub struct RwLockBellReadGuard<'a, T> {
 }
 
 impl<'a, T> RwLockBellReadGuard<'a, T> {
-    /// Transforms this guard into a [`MappedRwLockBellReadGuard`] that dereferences
-    /// to a subfield of the protected value.
+    /// Maps this guard to a subfield of the protected value.
     pub fn map<U, F>(mut self, f: F) -> MappedRwLockBellReadGuard<'a, U>
     where
         F: FnOnce(&T) -> &U,
@@ -307,9 +300,7 @@ impl<'a, T> RwLockBellReadGuard<'a, T> {
         }
     }
 
-    /// Attempts to transform this guard into a [`MappedRwLockBellReadGuard`].
-    ///
-    /// Returns `Err(self)` if `f` returns `None`, giving the original guard back.
+    /// Maps this guard to a subfield, returning `Err(self)` if `f` returns `None`.
     pub fn try_map<U, F>(mut self, f: F) -> Result<MappedRwLockBellReadGuard<'a, U>, Self>
     where
         F: FnOnce(&T) -> Option<&U>,
@@ -330,10 +321,7 @@ impl<'a, T> RwLockBellReadGuard<'a, T> {
         }
     }
 
-    /// Attempts to transform this guard into a [`MappedRwLockBellReadGuard`].
-    ///
-    /// Returns `Err((self, error))` if `f` returns `Err`, giving the original guard
-    /// and the error back.
+    /// Maps this guard to a subfield, returning `Err((self, e))` if `f` returns `Err(e)`.
     pub fn try_map_or_err<U, F, E>(
         mut self,
         f: F,
@@ -375,11 +363,9 @@ impl<'a, T> Drop for RwLockBellReadGuard<'a, T> {
     }
 }
 
-/// RAII read guard produced by [`RwLockBellReadGuard::map`] and related methods.
+/// RAII read guard produced by [`RwLockBellReadGuard::map`] and friends.
 ///
-/// Provides shared read access to a subfield of the protected value via [`Deref`].
-/// When dropped, releases the read lock and flushes pending callbacks just like
-/// [`RwLockBellReadGuard`].
+/// Behaves like [`RwLockBellReadGuard`] but dereferences to a subfield.
 #[derive(Debug)]
 pub struct MappedRwLockBellReadGuard<'a, T> {
     guard: Option<MappedRwLockReadGuard<'a, T>>,
@@ -402,11 +388,11 @@ impl<'a, T> Drop for MappedRwLockBellReadGuard<'a, T> {
 
 /// RAII write guard for [`RwLockBell`].
 ///
-/// Provides exclusive write access to the protected value via [`Deref`] and [`DerefMut`].
-/// When dropped, releases the lock and calls all callbacks that were registered via
-/// [`try_write_or`] while this guard was held.
+/// Provides exclusive write access via [`Deref`] and [`DerefMut`]. Dropping
+/// releases the lock and fires every callback registered via [`try_write_or`]
+/// while this guard was held.
 ///
-/// Obtained via [`RwLockBell::write`], [`RwLockBell::try_write`], or
+/// Returned by [`RwLockBell::write`], [`RwLockBell::try_write`], and
 /// [`RwLockBell::try_write_or`].
 ///
 /// [`try_write_or`]: RwLockBell::try_write_or
@@ -417,15 +403,13 @@ pub struct RwLockBellWriteGuard<'a, T> {
 }
 
 impl<'a, T> RwLockBellWriteGuard<'a, T> {
-    /// Transforms this guard into a [`MappedRwLockBellWriteGuard`] that dereferences
-    /// to a subfield of the protected value.
+    /// Maps this guard to a subfield of the protected value.
     pub fn map<U, F>(mut self, f: F) -> MappedRwLockBellWriteGuard<'a, U>
     where
         F: FnOnce(&mut T) -> &mut U,
     {
         let guard = self.guard.take().unwrap();
         let state = self.state;
-
         let map_guard = RwLockWriteGuard::map(guard, f);
         forget(self);
         MappedRwLockBellWriteGuard {
@@ -434,9 +418,7 @@ impl<'a, T> RwLockBellWriteGuard<'a, T> {
         }
     }
 
-    /// Attempts to transform this guard into a [`MappedRwLockBellWriteGuard`].
-    ///
-    /// Returns `Err(self)` if `f` returns `None`, giving the original guard back.
+    /// Maps this guard to a subfield, returning `Err(self)` if `f` returns `None`.
     pub fn try_map<U, F>(mut self, f: F) -> Result<MappedRwLockBellWriteGuard<'a, U>, Self>
     where
         F: FnOnce(&mut T) -> Option<&mut U>,
@@ -457,10 +439,7 @@ impl<'a, T> RwLockBellWriteGuard<'a, T> {
         }
     }
 
-    /// Attempts to transform this guard into a [`MappedRwLockBellWriteGuard`].
-    ///
-    /// Returns `Err((self, error))` if `f` returns `Err`, giving the original guard
-    /// and the error back.
+    /// Maps this guard to a subfield, returning `Err((self, e))` if `f` returns `Err(e)`.
     pub fn try_map_err<U, F, E>(
         mut self,
         f: F,
@@ -508,11 +487,9 @@ impl<'a, T> Drop for RwLockBellWriteGuard<'a, T> {
     }
 }
 
-/// RAII write guard produced by [`RwLockBellWriteGuard::map`] and related methods.
+/// RAII write guard produced by [`RwLockBellWriteGuard::map`] and friends.
 ///
-/// Provides exclusive write access to a subfield of the protected value via [`Deref`]
-/// and [`DerefMut`]. When dropped, releases the lock and flushes pending callbacks
-/// just like [`RwLockBellWriteGuard`].
+/// Behaves like [`RwLockBellWriteGuard`] but dereferences to a subfield.
 #[derive(Debug)]
 pub struct MappedRwLockBellWriteGuard<'a, T> {
     guard: Option<MappedRwLockWriteGuard<'a, T>>,
@@ -540,6 +517,8 @@ impl<'a, T> Drop for MappedRwLockBellWriteGuard<'a, T> {
 }
 
 fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
+    // `None` if a `map`-family method took the guard out and then panicked;
+    // in that case parking_lot already released the lock during the unwind.
     drop(guard.take());
 
     #[cfg(test)]
@@ -548,10 +527,8 @@ fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
     let callbacks = {
         let mut inner = state.inner.lock();
         inner.readers -= 1;
-        // Only the last reader drains; also skip if a concurrent drain is
-        // already running (`dropping = true`) — it would create a deadlock
-        // because both sides would sleep on `locking_zero` but
-        // `notify_one` only wakes a single waiter.
+        // Only the last reader drains; skip if another drain is already in
+        // flight (the queue would be empty or stolen again — both pointless).
         if inner.readers > 0 || inner.callbacks.is_empty() || inner.dropping {
             return;
         }
@@ -566,8 +543,6 @@ fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
         take(&mut inner.callbacks)
     };
 
-    // The read lock is already released; pass `()` so drain_and_run has
-    // nothing to drop before resetting `dropping` and running callbacks.
     drain_and_run(state, callbacks);
 }
 
@@ -582,25 +557,29 @@ fn drop_write_guard<G>(guard: &mut Option<G>, state: &LockState) {
         #[cfg(test)]
         hooks::run(hooks::HookPoint::WriteGuardAfterSettingDropping);
 
-        // Sleep until all in-flight try_write_or calls have either
-        // registered their callback or obtained the lock.
+        // Wait until every in-flight `try_write_or` has either pushed its
+        // callback or obtained the lock.
         while inner.locking != 0 {
             state.locking_zero.wait(&mut inner);
         }
         take(&mut inner.callbacks)
-        // Mutex released here — callbacks execute without holding any lock.
+        // Mutex released here.
     };
 
-    // Can be None if the map method panicked.
+    // `None` if a `map`-family method took the guard out and then panicked;
+    // in that case parking_lot already released the lock during the unwind.
     drop(guard.take());
 
     drain_and_run(state, callbacks);
 }
 
-/// Resets `dropping` to `false`, notifies waiters, then runs all collected
-/// callbacks, re-raising the first panic.
+/// Clears `dropping`, wakes [`try_write_or_else`] waiters, then runs every
+/// callback. Re-raises the first callback panic (if any) once the queue is
+/// fully drained — but only if we aren't already unwinding.
 ///
-/// Callers must have already set `dropping = true` and drained the callback queue.
+/// Caller must have set `dropping = true` and taken the callback queue.
+///
+/// [`try_write_or_else`]: RwLockBell::try_write_or_else
 fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
     #[cfg(test)]
     hooks::run(hooks::HookPoint::DrainAfterWriteLockRelease);
@@ -614,21 +593,18 @@ fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
     #[cfg(test)]
     hooks::run(hooks::HookPoint::DrainBeforeCallbacks);
 
-    // Run every callback regardless of panics, then re-raise the first
-    // panic (if any) after all callbacks have had a chance to execute.
-    // `catch_unwind` is called unconditionally before `or` so that every
-    // callback runs even if an earlier one panicked (`or_else` would
-    // short-circuit and skip the remaining callbacks).
+    // Run every callback, remember the first panic, re-raise after draining.
+    // `.or(result)` (not `.or_else`) ensures `catch_unwind` is called for
+    // every callback even after one has panicked.
     let first_panic = callbacks.into_iter().fold(None, |first, callback| {
         let result = panic::catch_unwind(AssertUnwindSafe(callback)).err();
         first.or(result)
     });
 
     if let Some(payload) = first_panic {
-        // If we are already unwinding from an outer panic (the guard was
-        // dropped as part of stack-unwinding), re-raising would trigger a
-        // double-panic and abort the process. Suppress the callback panic
-        // in that case — the outer panic carries the primary failure.
+        // If we're already mid-unwind (e.g. the guard was dropped during
+        // stack unwinding), re-raising would double-panic and abort. The
+        // outer panic carries the primary failure — drop the inner payload.
         if std::thread::panicking() {
             drop(payload);
         } else {
@@ -637,6 +613,7 @@ fn drain_and_run(state: &LockState, callbacks: Vec<Box<dyn FnOnce() + Send>>) {
     }
 }
 
+/// Calls `f`; if `f` panics, runs `on_panic` before the panic propagates.
 fn catch_panic<T>(f: impl FnOnce() -> T, on_panic: impl FnOnce()) -> T {
     struct Guard<F: FnOnce()>(Option<F>);
     impl<F: FnOnce()> Drop for Guard<F> {
