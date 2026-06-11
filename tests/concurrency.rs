@@ -74,6 +74,60 @@ fn test_try_write_or_races_last_read_guard_drop() {
     }
 }
 
+/// Regression: a callback queued by an in-flight `try_write_or_else` must
+/// fire even if the last read guard is dropped between the failed `try_write`
+/// and the callback being pushed.
+///
+/// The factory passed to `try_write_or_else` runs exactly in that window, so
+/// blocking inside it holds the call in-flight (`locking = 1`, queue still
+/// empty) while the last read guard drops. The drain must wait for the
+/// in-flight call and collect its callback; previously it returned early on
+/// the empty queue and the callback was stranded forever.
+#[test]
+fn test_callback_queued_during_last_read_guard_drop_still_fires() {
+    use std::sync::mpsc;
+
+    let lock = Arc::new(RwLockBell::new(0u64));
+    let fired = Arc::new(AtomicBool::new(false));
+
+    let r = lock.read();
+
+    let (factory_entered_tx, factory_entered_rx) = mpsc::channel();
+    let (release_factory_tx, release_factory_rx) = mpsc::channel::<()>();
+
+    let lock_t = lock.clone();
+    let fired_t = fired.clone();
+    let t = thread::spawn(move || {
+        let res = lock_t.try_write_or_else(move || {
+            factory_entered_tx.send(()).unwrap();
+            release_factory_rx.recv().unwrap();
+            move || fired_t.store(true, Relaxed)
+        });
+        assert!(res.is_none(), "the read guard was held at try_write time");
+    });
+
+    // The factory has been entered: try_write failed, callback not yet queued.
+    factory_entered_rx.recv().unwrap();
+
+    // Release the factory from a helper after a short delay so the drain
+    // decision in drop(r) below runs while the queue is still empty. The
+    // delay only matters for catching the regression: correct code blocks in
+    // drop(r) until the callback is pushed, regardless of timing.
+    let helper = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        release_factory_tx.send(()).unwrap();
+    });
+
+    drop(r);
+
+    helper.join().unwrap();
+    t.join().unwrap();
+    assert!(
+        fired.load(Relaxed),
+        "callback queued by an in-flight try_write_or_else must fire once the lock is free"
+    );
+}
+
 #[test]
 fn test_stress_many_writers_one_reader() {
     const WRITERS: usize = 32;

@@ -447,6 +447,102 @@ fn test_callbacks_run_after_dropping_is_reset() {
     assert!(callback_ran.load(Relaxed));
 }
 
+// ─── regression: last-reader drain must wait for in-flight try_write_or ──────
+
+/// Regression for the lost-callback race in `drop_read_guard`.
+///
+/// Previously the last-reader drain returned early when the callback queue
+/// was empty, without checking `locking`. An in-flight `try_write_or` whose
+/// `try_write` had already failed (against this very read lock) would then
+/// push its callback *after* the drain decision, stranding it forever even
+/// though the lock was completely free. The fix is to drain whenever
+/// `locking != 0`, waiting on `locking_zero` like the write-guard path does.
+///
+/// Sequencing (fully deterministic):
+/// 1. Main holds a read guard R.
+/// 2. Thread T calls `try_write_or_else`; its `try_write` fails (R is held)
+///    and the factory blocks on `gate_factory` — T is now in-flight with
+///    `locking=1` and an empty callback queue.
+/// 3. Main drops R. The drain must take the non-early-return path: it sets
+///    `dropping=true` (hook signals `gate_drain`) and waits on `locking_zero`.
+/// 4. The opener thread sees `gate_drain`, releases `gate_factory`; T builds
+///    its callback, pushes it, and decrements `locking` to 0.
+/// 5. Main's drain wakes, collects T's callback, and fires it before
+///    `drop(R)` returns.
+///
+/// With the bug, step 3 returns early instead: the hook never fires, the
+/// opener and T block forever, and the watchdog aborts the test.
+#[test]
+fn regression_last_reader_drain_waits_for_in_flight_locking() {
+    let _g = TestGuard::acquire();
+    let lock = Arc::new(RwLockBell::new(0u64));
+    let fired = Arc::new(AtomicBool::new(false));
+
+    // gate_factory: blocks T inside the callback factory (after try_write
+    // failed, before the callback is pushed).
+    let gate_factory = Gate::new();
+
+    // gate_drain: signalled when the read drain sets dropping=true.
+    // Fires while holding the state mutex; signal() only (non-blocking).
+    let gate_drain = Gate::new();
+    let gd2 = gate_drain.clone();
+    hooks::set(HookPoint::ReadGuardAfterSettingDropping, move || {
+        hooks::clear(HookPoint::ReadGuardAfterSettingDropping); // one-shot
+        gd2.signal();
+    });
+
+    let r = lock.read();
+
+    // Thread T: in-flight try_write_or_else, held open by the factory gate.
+    let lock_t = lock.clone();
+    let fired_t = fired.clone();
+    let gf2 = gate_factory.clone();
+    let t = thread::spawn(move || {
+        let res = lock_t.try_write_or_else(move || {
+            gf2.wait(); // try_write already failed; locking=1, queue empty
+            move || fired_t.store(true, Relaxed)
+        });
+        assert!(res.is_none(), "read guard was held at try_write time");
+    });
+
+    gate_factory.wait_for_arrival(); // T is in-flight, callback not yet pushed
+
+    // Opener: once the drain has committed (dropping=true, about to wait on
+    // locking_zero), release T so it pushes its callback and wakes the drain.
+    let gf3 = gate_factory.clone();
+    let opener = thread::spawn(move || {
+        gate_drain.wait_for_arrival();
+        gf3.open();
+    });
+
+    // Watchdog so a regression aborts instead of hanging the test runner.
+    let watchdog_stop = Arc::new(AtomicBool::new(false));
+    let watchdog_stop2 = watchdog_stop.clone();
+    let watchdog = thread::spawn(move || {
+        for _ in 0..50 {
+            if watchdog_stop2.load(Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("[regression_last_reader_drain_waits_for_in_flight_locking] WATCHDOG fired");
+        std::process::abort();
+    });
+
+    // Last reader drops: the drain must wait for T and fire its callback.
+    drop(r);
+
+    opener.join().unwrap();
+    t.join().unwrap();
+    assert!(
+        fired.load(Relaxed),
+        "callback pushed by the in-flight call must be collected by the read drain"
+    );
+
+    watchdog_stop.store(true, Relaxed);
+    watchdog.join().unwrap();
+}
+
 // ─── regression: read-drain + write-drain both waiting on locking_zero ────────
 
 /// Regression for the double-drain deadlock.

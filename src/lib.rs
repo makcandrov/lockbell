@@ -527,9 +527,9 @@ fn drop_read_guard<G>(guard: &mut Option<G>, state: &LockState) {
     let callbacks = {
         let mut inner = state.inner.lock();
         inner.readers -= 1;
-        // Only the last reader drains; skip if another drain is already in
-        // flight (the queue would be empty or stolen again — both pointless).
-        if inner.readers > 0 || inner.callbacks.is_empty() || inner.dropping {
+        // Only the last reader drains; skip if another drain is already in flight.
+        if inner.readers > 0 || inner.dropping || (inner.callbacks.is_empty() && inner.locking == 0)
+        {
             return;
         }
         inner.dropping = true;
