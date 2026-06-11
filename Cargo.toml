@@ -1,10 +1,11 @@
 [package]
 name = "lockbell"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 rust-version = "1.88"
 repository = "https://github.com/makcandrov/lockbell"
 homepage = "https://github.com/makcandrov/lockbell"
+documentation = "https://docs.rs/lockbell"
 description = "An RwLock that rings back when contention clears."
 license = "MIT OR Apache-2.0"
 keywords = ["lock", "bell", "rwlock"]
