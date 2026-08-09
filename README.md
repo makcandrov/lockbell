@@ -43,41 +43,9 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
 [`try_write_or`]: https://docs.rs/lockbell/latest/lockbell/struct.RwLockBell.html#method.try_write_or
 [`try_write_or_else`]: https://docs.rs/lockbell/latest/lockbell/struct.RwLockBell.html#method.try_write_or_else
 
-## Guards
-
-The bell rings from every guard flavour:
-
-| | borrowed | mapped | via `Arc` |
-|---|---|---|---|
-| shared | `RwLockBellReadGuard<'a, T>` | `MappedRwLockBellReadGuard<'a, T>` | `ArcRwLockBellReadGuard<T>` |
-| exclusive | `RwLockBellWriteGuard<'a, T>` | `MappedRwLockBellWriteGuard<'a, T>` | `ArcRwLockBellWriteGuard<T>` |
-
-The `Arc` guards carry no lifetime: they hold the `Arc<RwLockBell<T>>` itself
-rather than a reference into it, so they can be stored in an owning struct
-without laundering a lifetime to `'static`.
-
-```rust
-# #[cfg(feature = "arc")] {
-use std::sync::Arc;
-use lockbell::{ArcRwLockBellReadGuard, RwLockBell};
-
-// No lifetime attached: keeps the allocation alive on its own.
-struct Owned(ArcRwLockBellReadGuard<Vec<u32>>);
-
-let owned = {
-    let lock = Arc::new(RwLockBell::new(vec![1u32]));
-    Owned(lock.read_arc())
-};
-assert_eq!(owned.0[0], 1);
-# }
-```
-
-`try_write_or` has an `Arc` counterpart too — `try_write_arc_or` — so the bell
-works the same whether you hold the lock by reference or by `Arc`.
-
 ## Callback semantics
 
-- Callbacks run **after** the lock is released, in registration order.
+- Callbacks run **after** the guard they lost to is released, in registration order. A callback is never rung while the very guard that turned it away is still holding the lock.
 - A callback is a notification, not a lock acquisition — the lock may already be re-acquired by the time the callback fires.
 - Callbacks must be `FnOnce() + Send + 'static`.
 - A panicking callback does not prevent subsequent callbacks from running.
@@ -93,8 +61,21 @@ works the same whether you hold the lock by reference or by `Arc`.
 
 ```toml
 [dependencies]
-lockbell = "0.1"
+lockbell = "0.2"
 ```
+
+## Features
+
+- **`arc`** *(default)* — `Arc`-based guards that carry no lifetime, and the
+  `read_arc` / `write_arc` / `try_write_arc_or` family that produces them. They
+  hold the `Arc<RwLockBell<T>>` itself rather than a reference into it, so they
+  can be stored in an owning struct without laundering a lifetime to `'static`.
+  Enables `parking_lot/arc_lock`.
+- **`raw`** — exports `RawRwLockBell`, so it can be used as a `lock_api` raw
+  lock directly. An escape hatch: in a bare `lock_api::RwLock<RawRwLockBell, T>`
+  the `Debug` impl and `force_unlock_read` / `force_unlock_write` all release a
+  lock, so they ring the bell — and can therefore block and panic. `RwLockBell`
+  exists to keep those operations away from it.
 
 ## Use cases
 

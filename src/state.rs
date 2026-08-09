@@ -1,8 +1,5 @@
-//! Bell bookkeeping shared by every guard flavour.
-//!
-//! [`LockState`] lives inside [`RawRwLockBell`](crate::RawRwLockBell) and is
-//! guarded by its own mutex; it never grants or releases access to the
-//! protected data.
+//! Bell bookkeeping. Lives inside [`RawRwLockBell`](crate::RawRwLockBell) under
+//! its own mutex; never grants or releases access to the protected data.
 
 use std::{
     fmt::Debug,
@@ -17,24 +14,17 @@ use crate::tests::hooks;
 
 pub(crate) type Callback = Box<dyn FnOnce() + Send>;
 
-// ─── LockStateInner ──────────────────────────────────────────────────────────
-
 #[derive(Default)]
 pub(crate) struct LockStateInner {
-    /// Drains in progress, counted from committing to a drain to flushing its
-    /// callbacks.
-    ///
-    /// A count rather than a flag: a read-drain and a write-drain can overlap,
-    /// and the write-drain still holds the exclusive lock across its share of
-    /// the window. Clearing on the first one to finish would let a
-    /// `try_write_or_else` queue a callback that the other has already
-    /// snapshotted past — and that callback would never ring.
+    /// Drains in flight. A count, not a flag: drains overlap, and one still
+    /// holds the lock while another finishes. Reopening the gate on the first
+    /// to finish would let a callback be queued into an already-taken batch.
     pub(crate) draining: u64,
-    /// In-flight `try_write_or_else` calls between bumping the counter and resolving.
+    /// In-flight `try_write_or_else` calls, between bumping and resolving.
     pub(crate) locking: u64,
     /// Live shared-lock count.
     pub(crate) readers: u64,
-    /// Callbacks queued by failed `try_write_or` calls, FIFO order.
+    /// FIFO queue of callbacks from failed `try_write_or` calls.
     pub(crate) callbacks: Vec<Callback>,
 }
 
@@ -49,8 +39,8 @@ impl LockStateInner {
     pub(crate) fn decrement_locking(&mut self, locking_zero: &Condvar) {
         self.locking -= 1;
         if self.locking == 0 {
-            // `notify_all`: a read-drain and a write-drain can both wait on
-            // `locking_zero` concurrently; `notify_one` would strand one of them.
+            // Only one drainer can be parked here, so `notify_one` would do;
+            // `notify_all` avoids depending on that argument.
             locking_zero.notify_all();
         }
     }
@@ -67,8 +57,6 @@ impl Debug for LockStateInner {
     }
 }
 
-// ─── LockState ───────────────────────────────────────────────────────────────
-
 #[derive(Default)]
 pub(crate) struct LockState {
     pub(crate) inner: Mutex<LockStateInner>,
@@ -79,8 +67,7 @@ pub(crate) struct LockState {
 }
 
 impl LockState {
-    // Interior mutability is the point: this is the initial value copied into
-    // each new lock, exactly like `RawRwLock::INIT`.
+    // Interior mutability is the point, as with `RawRwLock::INIT`.
     #[allow(clippy::declare_interior_mutable_const)]
     pub(crate) const NEW: Self = Self {
         inner: Mutex::new(LockStateInner::NEW),
@@ -105,27 +92,18 @@ impl Debug for LockState {
     }
 }
 
-// ─── draining ────────────────────────────────────────────────────────────────
-
-/// Closes this drain, waking [`try_write_or_else`] waiters once the *last*
-/// concurrent drain is done, then runs every callback. Re-raises the first
-/// callback panic (if any) once the queue is fully drained — but only if we
-/// aren't already unwinding.
+/// Closes this drain, then runs every callback, re-raising the first panic.
 ///
-/// Caller must have bumped `draining` and taken the callback queue, and must
-/// already have released the lock it held.
-///
-/// [`try_write_or_else`]: crate::RwLockBell::try_write_or_else
+/// Caller must have bumped `draining`, taken the queue, and released its lock.
 pub(crate) fn drain_and_run(state: &LockState, callbacks: Vec<Callback>) {
     #[cfg(test)]
-    hooks::run(hooks::HookPoint::DrainAfterWriteLockRelease);
+    hooks::run(hooks::HookPoint::DrainBeforeGateReopens);
 
     {
         let mut inner = state.inner.lock();
         inner.draining -= 1;
-        // Only the last drain out reopens the gate: an overlapping drain may
-        // still be holding the lock, and a callback queued against it now
-        // would be stranded.
+        // Only the last drain out reopens the gate; an overlapping one may
+        // still hold the lock.
         if inner.draining == 0 {
             state.not_draining.notify_all();
         }
@@ -134,18 +112,15 @@ pub(crate) fn drain_and_run(state: &LockState, callbacks: Vec<Callback>) {
     #[cfg(test)]
     hooks::run(hooks::HookPoint::DrainBeforeCallbacks);
 
-    // Run every callback, remember the first panic, re-raise after draining.
-    // `.or(result)` (not `.or_else`) ensures `catch_unwind` is called for
-    // every callback even after one has panicked.
+    // `.or(result)`, not `.or_else`: every callback must still run after one
+    // has panicked.
     let first_panic = callbacks.into_iter().fold(None, |first, callback| {
         let result = panic::catch_unwind(AssertUnwindSafe(callback)).err();
         first.or(result)
     });
 
     if let Some(payload) = first_panic {
-        // If we're already mid-unwind (e.g. the guard was dropped during
-        // stack unwinding), re-raising would double-panic and abort. The
-        // outer panic carries the primary failure — drop the inner payload.
+        // Re-raising mid-unwind would abort; the outer panic is the primary one.
         if std::thread::panicking() {
             drop(payload);
         } else {

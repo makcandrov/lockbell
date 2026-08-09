@@ -170,8 +170,6 @@ fn test_arc_write_guard_is_last_reference() {
     drop(guard);
 }
 
-// ─── try_write_arc_or ────────────────────────────────────────────────────────
-
 #[test]
 fn test_try_write_arc_or_success_returns_arc_guard() {
     use std::sync::atomic::{AtomicBool, Ordering::Relaxed};

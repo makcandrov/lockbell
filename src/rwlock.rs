@@ -10,9 +10,8 @@ use parking_lot::lock_api;
 use crate::{ArcRwLockBellReadGuard, ArcRwLockBellWriteGuard};
 use crate::{RwLockBellReadGuard, RwLockBellWriteGuard, raw::RawRwLockBell};
 
-/// The `lock_api` lock we wrap. Kept private: exposing it would put every
-/// `lock_api` operation — including the ones that ring the bell where you
-/// would not expect it — back into the public API.
+/// Kept private: exposing it would put every `lock_api` operation — including
+/// the ones that ring the bell unexpectedly — back into the public API.
 type RawLock<T> = lock_api::RwLock<RawRwLockBell, T>;
 
 /// An [`RwLock`](parking_lot::RwLock) that fires queued callbacks when
@@ -22,16 +21,18 @@ type RawLock<T> = lock_api::RwLock<RawRwLockBell, T>;
 /// queued. All queued callbacks fire in FIFO order, without the firing thread
 /// holding any lock, when the next write guard (or last reader) is dropped.
 ///
-/// A callback is guaranteed to run only if the lock outlives it: dropping the
-/// lock (or calling [`into_inner`]) discards whatever is still queued without
-/// calling it.
+/// Both release paths snapshot the queue while still holding the lock, so a
+/// batch only contains callbacks that lost their race to the guard now
+/// releasing; none is rung while the holder that turned it away still holds. A
+/// *different* thread may have taken the lock by then.
+///
+/// Dropping the lock, or calling [`into_inner`], discards whatever is still
+/// queued without calling it.
 ///
 /// [`try_write_or`]: Self::try_write_or
 /// [`into_inner`]: Self::into_inner
 #[repr(transparent)]
 pub struct RwLockBell<T: ?Sized>(RawLock<T>);
-
-// ─── construction ────────────────────────────────────────────────────────────
 
 impl<T> RwLockBell<T> {
     /// Creates a new `RwLockBell` wrapping `value`.
@@ -85,8 +86,6 @@ impl<T> From<T> for RwLockBell<T> {
     }
 }
 
-// ─── shared access ───────────────────────────────────────────────────────────
-
 impl<T: ?Sized> RwLockBell<T> {
     /// Locks for shared access, blocking until acquired.
     ///
@@ -107,8 +106,6 @@ impl<T: ?Sized> RwLockBell<T> {
         self.0.try_read().map(RwLockBellReadGuard)
     }
 }
-
-// ─── exclusive access ────────────────────────────────────────────────────────
 
 impl<T: ?Sized> RwLockBell<T> {
     /// Locks for exclusive access, blocking until acquired.
@@ -153,55 +150,48 @@ impl<T: ?Sized> RwLockBell<T> {
         self.try_write_or_else(|| callback)
     }
 
-    /// Like [`try_write_or`], but builds the callback lazily.
-    ///
-    /// On contention, `factory()` is called to produce the queued callback.
-    /// Prefer this when constructing the callback is expensive or has side
-    /// effects that should only run on failure.
+    /// Like [`try_write_or`], but builds the callback lazily: `factory` runs
+    /// only on contention.
     ///
     /// # Deadlock
     ///
-    /// `factory` runs inside the window that a concurrent unlock waits on, and
-    /// that unlock still holds the exclusive lock while it waits. So `factory`
-    /// **must not touch this lock and must not block**:
+    /// `factory` runs inside the window a concurrent unlock waits on, and that
+    /// unlock still holds the lock — shared or exclusive — while it waits. So
+    /// `factory` **must not touch this lock and must not block**:
     ///
     /// ```no_run
     /// # use lockbell::RwLockBell;
     /// # let lock = RwLockBell::new(0u64);
-    /// // Deadlocks: the writer we lost to cannot release until `factory` returns.
+    /// // Deadlocks: the guard we lost to cannot release until `factory` returns.
     /// let _ = lock.try_write_or_else(|| {
-    ///     let value = *lock.read();
+    ///     let value = *lock.write();
     ///     move || println!("{value}")
     /// });
     /// ```
     ///
-    /// The queued callback itself has no such restriction — it runs after the
-    /// lock has been released, and may freely re-acquire it.
+    /// The queued callback has no such restriction: it runs after the release
+    /// and may freely re-acquire the lock.
     ///
     /// # Blocking
     ///
-    /// Unlike [`try_write`], this is not a wait-free probe. If a guard release
-    /// is concurrently flushing the queue, the call waits for that flush to
-    /// hand back the lock before deciding. That wait is what makes the
-    /// guarantee hold: without it the callback could land in a batch that has
-    /// already been taken, and would never ring at all.
+    /// Unlike [`try_write`], this is not a wait-free probe: it waits out a
+    /// concurrent flush before deciding. Without that wait the callback could
+    /// land in an already-taken batch and never ring.
     ///
-    /// The wait covers only the bell bookkeeping — never the protected data,
-    /// and never a queued callback (those run after the wait is released). It
-    /// does cover any concurrent `factory`, which is the other half of why
-    /// `factory` must not block.
+    /// The wait covers the bell bookkeeping and any concurrent `factory` —
+    /// never the protected data, never a queued callback.
     ///
     /// [`try_write`]: Self::try_write
     ///
     /// # Panics
     ///
-    /// If `factory` panics, the panic propagates to the caller and no callback
-    /// is queued; the lock's bookkeeping is left consistent.
+    /// A panicking `factory` propagates to the caller; no callback is queued and
+    /// the bookkeeping stays consistent.
     ///
-    /// If a queued *callback* panics, the remaining callbacks still run and the
-    /// first panic is re-raised afterwards from whichever thread was draining —
-    /// unless that thread is already unwinding, in which case the payload is
-    /// dropped to avoid an abort.
+    /// A panicking *callback* does not stop the rest of the batch. The first
+    /// panic is re-raised from the draining thread afterwards, unless that
+    /// thread is already unwinding, in which case it is dropped to avoid an
+    /// abort.
     ///
     /// [`try_write_or`]: Self::try_write_or
     pub fn try_write_or_else<Callback, Factory>(
@@ -213,8 +203,7 @@ impl<T: ?Sized> RwLockBell<T> {
         Callback: FnOnce() + Send + 'static,
     {
         if self.raw().try_lock_exclusive_or_else(factory) {
-            // SAFETY: the exclusive lock was just acquired above, and is
-            // handed to exactly one guard.
+            // SAFETY: just acquired above, handed to exactly one guard.
             Some(RwLockBellWriteGuard(unsafe {
                 self.0.make_write_guard_unchecked()
             }))
@@ -223,8 +212,6 @@ impl<T: ?Sized> RwLockBell<T> {
         }
     }
 }
-
-// ─── access through an `Arc` ─────────────────────────────────────────────────
 
 #[cfg(feature = "arc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "arc")))]
@@ -297,8 +284,7 @@ impl<T: ?Sized> RwLockBell<T> {
         Callback: FnOnce() + Send + 'static,
     {
         if self.raw().try_lock_exclusive_or_else(factory) {
-            // SAFETY: the exclusive lock was just acquired above, and is
-            // handed to exactly one guard.
+            // SAFETY: just acquired above, handed to exactly one guard.
             Some(ArcRwLockBellWriteGuard(unsafe {
                 self.as_raw_arc().make_arc_write_guard_unchecked()
             }))
@@ -307,8 +293,6 @@ impl<T: ?Sized> RwLockBell<T> {
         }
     }
 }
-
-// ─── inspection ──────────────────────────────────────────────────────────────
 
 impl<T: ?Sized> RwLockBell<T> {
     /// Whether the lock is currently held in any mode.
@@ -332,59 +316,45 @@ impl<T: ?Sized> RwLockBell<T> {
 
 /// Formats the protected value if it can be read, `<locked>` otherwise.
 ///
-/// Formatting never rings the bell: it takes a shared lock that bypasses the
-/// callback machinery entirely, so `{:?}` cannot run a callback, block on a
-/// concurrent [`try_write_or_else`] factory, or panic.
-///
-/// The trade-off is that a `try_write_or` losing a race to this transient lock
-/// has its callback queued until the next real guard release, rather than
-/// being drained here.
-///
-/// [`try_write_or_else`]: RwLockBell::try_write_or_else
+/// Never rings the bell: the shared lock it takes bypasses the callback
+/// machinery, so `{:?}` cannot run a callback, block or panic. In exchange, a
+/// `try_write_or` losing to this transient lock waits for the next real
+/// release rather than being drained here.
 impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockBell<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = f.debug_struct("RwLockBell");
         match self.raw().peek() {
             Some(_peek) => {
-                // SAFETY: `_peek` holds a shared lock for as long as it is
-                // alive, so the value cannot be mutated while we format it.
+                // SAFETY: `_peek` holds a shared lock for the whole borrow.
                 let data = unsafe { &*self.0.data_ptr() };
                 out.field("data", &data)
             }
-            // `format_args!` avoids quoting `<locked>` in the output.
+            // `format_args!` avoids quoting `<locked>`.
             None => out.field("data", &format_args!("<locked>")),
         }
         .finish()
     }
 }
 
-// ─── internals ───────────────────────────────────────────────────────────────
-
 impl<T: ?Sized> RwLockBell<T> {
     /// The raw lock, for driving the bell protocol.
     #[inline]
     fn raw(&self) -> &RawRwLockBell {
-        // SAFETY: used only to run the bell protocol and to acquire the
-        // exclusive lock. Nothing here unlocks it, so no live guard's
-        // invariant is disturbed.
+        // SAFETY: only ever used to acquire, never to unlock, so no live
+        // guard's invariant is disturbed.
         unsafe { self.0.raw() }
     }
 
-    /// Borrows `Arc<Self>` as `Arc<RawLock<T>>` so that `lock_api`'s
-    /// `Arc`-guard constructors — which only accept their own type — can be
-    /// used to build our `Arc` guards.
-    ///
-    /// The result is a *borrow*: it must not be dropped as an owned `Arc`,
-    /// hence the [`ManuallyDrop`]. The guard constructors take it by reference
-    /// and clone it themselves, so exactly one strong count is added per guard.
+    /// Borrows `Arc<Self>` as `Arc<RawLock<T>>`, which is all `lock_api`'s
+    /// `Arc`-guard constructors accept. They clone it themselves, so exactly
+    /// one strong count is added per guard.
     #[cfg(feature = "arc")]
     #[inline]
     fn as_raw_arc(self: &Arc<Self>) -> ManuallyDrop<Arc<RawLock<T>>> {
         let ptr = Arc::as_ptr(self) as *const RawLock<T>;
-        // SAFETY: `RwLockBell` is `#[repr(transparent)]` over `RawLock<T>`, so
-        // the pointer is valid for that type with the same metadata. Wrapping
-        // in `ManuallyDrop` means the strong count borrowed from `self` is
-        // never released, so `self` stays the sole owner of it.
+        // SAFETY: `#[repr(transparent)]`, so the pointer is valid for
+        // `RawLock<T>` with the same metadata. `ManuallyDrop` keeps the strong
+        // count borrowed from `self` from ever being released.
         ManuallyDrop::new(unsafe { Arc::from_raw(ptr) })
     }
 }

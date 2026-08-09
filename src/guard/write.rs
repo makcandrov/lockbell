@@ -9,8 +9,6 @@ type RawMapped<'a, T> = lock_api::MappedRwLockWriteGuard<'a, RawRwLockBell, T>;
 #[cfg(feature = "arc")]
 type RawArc<T> = lock_api::ArcRwLockWriteGuard<RawRwLockBell, T>;
 
-// ─── RwLockBellWriteGuard ────────────────────────────────────────────────────
-
 /// RAII exclusive guard for [`RwLockBell`](crate::RwLockBell).
 ///
 /// Dropping it releases the lock and fires every callback registered via
@@ -28,8 +26,7 @@ pub struct RwLockBellWriteGuard<'a, T: ?Sized>(pub(crate) RawGuard<'a, T>);
 impl<'a, T: ?Sized> RwLockBellWriteGuard<'a, T> {
     /// Maps this guard to a component of the protected value.
     ///
-    /// An associated function, not a method, so it cannot shadow a method of
-    /// the same name on `T`.
+    /// An associated function so it cannot shadow a method on `T`.
     pub fn map<U: ?Sized, F>(s: Self, f: F) -> MappedRwLockBellWriteGuard<'a, U>
     where
         F: FnOnce(&mut T) -> &mut U,
@@ -65,8 +62,6 @@ impl<'a, T: ?Sized> RwLockBellWriteGuard<'a, T> {
 
 forward_shared_traits!(RwLockBellWriteGuard<'a>);
 forward_mut_traits!(RwLockBellWriteGuard<'a>);
-
-// ─── MappedRwLockBellWriteGuard ──────────────────────────────────────────────
 
 /// RAII exclusive guard produced by [`RwLockBellWriteGuard::map`] and friends.
 ///
@@ -111,8 +106,6 @@ impl<'a, T: ?Sized> MappedRwLockBellWriteGuard<'a, T> {
 
 forward_shared_traits!(MappedRwLockBellWriteGuard<'a>);
 forward_mut_traits!(MappedRwLockBellWriteGuard<'a>);
-
-// ─── ArcRwLockBellWriteGuard ─────────────────────────────────────────────────
 
 /// Exclusive guard obtained through an [`Arc`], with no lifetime attached.
 ///

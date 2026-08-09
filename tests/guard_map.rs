@@ -8,8 +8,6 @@ use std::{
 
 use lockbell::{RwLockBell, RwLockBellReadGuard, RwLockBellWriteGuard};
 
-// ─── read guard map ──────────────────────────────────────────────────────────
-
 #[test]
 fn test_map_read_guard() {
     let lock = RwLockBell::new((1u64, 2u64));
@@ -90,8 +88,6 @@ fn test_try_map_or_err_read_guard_failure() {
     assert_eq!(err, "oops");
     assert_eq!(*original, (1, 2));
 }
-
-// ─── write guard map ─────────────────────────────────────────────────────────
 
 #[test]
 fn test_map_write_guard() {
@@ -182,8 +178,6 @@ fn test_try_map_err_write_guard_failure() {
     assert_eq!(*original, (1, 2));
 }
 
-// ─── panic safety regressions ────────────────────────────────────────────────
-//
 // These verify that a panic in the user-supplied projection closure does not
 // corrupt the lock's internal state.
 //
@@ -203,8 +197,6 @@ fn test_try_map_err_write_guard_failure() {
 //   - write side: the write-drop drain is skipped entirely → callbacks queued
 //                 while this write guard was held are not flushed, even though
 //                 the lock has actually been released.
-
-// ─── read side: panic must not leak the `state.readers` counter ──────────────
 
 #[test]
 fn regression_read_map_panic_does_not_leak_readers() {
@@ -291,8 +283,6 @@ fn regression_read_try_map_or_err_panic_does_not_leak_readers() {
         "callback must fire after last read drops"
     );
 }
-
-// ─── write side: panic must still drain pending callbacks ────────────────────
 
 #[test]
 fn regression_write_map_panic_drains_pending_callbacks() {

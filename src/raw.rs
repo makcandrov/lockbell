@@ -9,30 +9,22 @@ use crate::state::{LockState, catch_panic, drain_and_run};
 #[cfg(test)]
 use crate::tests::hooks;
 
-/// Raw reader-writer lock that fires queued callbacks when contention clears.
-///
-/// This is the [`lock_api::RawRwLock`] implementation behind
-/// [`RwLockBell`](crate::RwLockBell); you rarely need to name it. It wraps
-/// [`parking_lot::RawRwLock`] and adds the callback queue.
+/// The [`lock_api::RawRwLock`] behind [`RwLockBell`](crate::RwLockBell):
+/// [`parking_lot::RawRwLock`] plus the callback queue.
 ///
 /// # Using it directly
 ///
-/// Nothing stops you from building a `lock_api::RwLock<RawRwLockBell, T>`
-/// yourself, but [`RwLockBell`](crate::RwLockBell) exists precisely to keep
-/// the bell out of operations where firing it would surprise you. In
-/// particular, `lock_api`'s `Debug` impl and `force_unlock_read` /
-/// `force_unlock_write` all release a lock, so with the raw type they run
-/// queued callbacks — which means they can block and can panic. Prefer
-/// [`RwLockBell`](crate::RwLockBell).
+/// Prefer [`RwLockBell`](crate::RwLockBell). In a bare
+/// `lock_api::RwLock<RawRwLockBell, T>`, the `Debug` impl and
+/// `force_unlock_read` / `force_unlock_write` all release a lock, so they run
+/// queued callbacks — and can therefore block and panic.
 ///
 /// # Extending it
 ///
 /// Do **not** implement [`RawRwLockFair`], [`RawRwLockDowngrade`],
-/// [`RawRwLockRecursive`] or [`RawRwLockUpgrade`] by plain delegation. Each of
-/// them acquires or releases a lock without passing through
-/// [`lock_shared`]/[`unlock_shared`], so the reader count would drift:
-/// `unlock_shared_fair` would leak a reader (permanently disabling the
-/// read-side drain) and `unlock_exclusive_fair` would skip the drain outright.
+/// [`RawRwLockRecursive`] or [`RawRwLockUpgrade`] by plain delegation: each
+/// bypasses [`lock_shared`]/[`unlock_shared`], so `unlock_shared_fair` would
+/// leak a reader and `unlock_exclusive_fair` would skip the drain.
 ///
 /// [`RawRwLockFair`]: lock_api::RawRwLockFair
 /// [`RawRwLockDowngrade`]: lock_api::RawRwLockDowngrade
@@ -60,9 +52,8 @@ impl Debug for RawRwLockBell {
     }
 }
 
-// SAFETY: every method forwards its locking obligation to `self.raw`, which is
-// a correct `RawRwLock`. The bell bookkeeping in `state` is guarded by its own
-// mutex and never grants or releases access to the protected data.
+// SAFETY: every method forwards its locking obligation to `self.raw`. The bell
+// bookkeeping never grants or releases access to the protected data.
 unsafe impl lock_api::RawRwLock for RawRwLockBell {
     #[allow(clippy::declare_interior_mutable_const)]
     const INIT: Self = Self {
@@ -87,39 +78,49 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
     }
 
     unsafe fn unlock_shared(&self) {
-        // SAFETY: forwarded from this method's own contract.
-        unsafe { self.raw.unlock_shared() };
+        // Bookkeeping before the release, as in `unlock_exclusive`. Releasing
+        // first would let another thread take the lock while `readers` still
+        // reads non-zero, and our batch could then sweep up callbacks that lost
+        // to *that* thread — rung while it still holds, and never rung again.
+        let mut inner = self.state.inner.lock();
+
+        // Wrapping would park `readers` near `u64::MAX` and silently kill the
+        // read-side bell for good.
+        debug_assert!(inner.readers > 0, "unbalanced unlock_shared");
+        inner.readers = inner.readers.saturating_sub(1);
+
+        // Only the last reader drains. An in-flight drain either has not taken
+        // the queue yet (and waits on `locking`) or has, leaving it empty until
+        // `draining` hits 0.
+        if inner.readers > 0
+            || inner.draining > 0
+            || (inner.callbacks.is_empty() && inner.locking == 0)
+        {
+            drop(inner);
+
+            // SAFETY: forwarded from this method's own contract.
+            unsafe { self.raw.unlock_shared() };
+            return;
+        }
+
+        inner.draining += 1;
 
         #[cfg(test)]
-        hooks::run(hooks::HookPoint::ReadGuardAfterRelease);
+        hooks::run(hooks::HookPoint::ReadGuardAfterEnteringDrain);
 
-        let callbacks = {
-            let mut inner = self.state.inner.lock();
-            // Wrapping here would park `readers` near `u64::MAX` and silently
-            // disable the read-side bell for the rest of the lock's life, so
-            // say so loudly in debug and stay at the floor in release.
-            debug_assert!(inner.readers > 0, "unbalanced unlock_shared");
-            inner.readers = inner.readers.saturating_sub(1);
-            // Only the last reader drains; skip if another drain is already in
-            // flight, since it either has not taken the queue yet (and will
-            // wait for `locking`) or has, in which case the queue is empty and
-            // stays empty until `draining` hits 0.
-            if inner.readers > 0
-                || inner.draining > 0
-                || (inner.callbacks.is_empty() && inner.locking == 0)
-            {
-                return;
-            }
-            inner.draining += 1;
+        // Wait out every in-flight `try_write_or`. We still hold the shared
+        // lock, so they are all bound to fail against us and queue.
+        while inner.locking != 0 {
+            self.state.locking_zero.wait(&mut inner);
+        }
+        let callbacks = take(&mut inner.callbacks);
+        drop(inner);
 
-            #[cfg(test)]
-            hooks::run(hooks::HookPoint::ReadGuardAfterEnteringDrain);
+        #[cfg(test)]
+        hooks::run(hooks::HookPoint::ReadGuardBeforeRawUnlock);
 
-            while inner.locking != 0 {
-                self.state.locking_zero.wait(&mut inner);
-            }
-            take(&mut inner.callbacks)
-        };
+        // SAFETY: forwarded from this method's own contract.
+        unsafe { self.raw.unlock_shared() };
 
         drain_and_run(&self.state, callbacks);
     }
@@ -143,13 +144,11 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
             #[cfg(test)]
             hooks::run(hooks::HookPoint::WriteGuardAfterEnteringDrain);
 
-            // Wait until every in-flight `try_write_or` has either pushed its
-            // callback or obtained the lock.
+            // Wait out every in-flight `try_write_or`.
             while inner.locking != 0 {
                 self.state.locking_zero.wait(&mut inner);
             }
             take(&mut inner.callbacks)
-            // Mutex released here.
         };
 
         #[cfg(test)]
@@ -161,8 +160,7 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
         drain_and_run(&self.state, callbacks);
     }
 
-    // The provided implementations probe the lock by acquiring and releasing
-    // it, which would fire the bell. Delegate instead.
+    // The provided impls probe by acquiring and releasing, which would ring.
     fn is_locked(&self) -> bool {
         self.raw.is_locked()
     }
@@ -176,24 +174,18 @@ impl RawRwLockBell {
     /// Attempts to acquire the exclusive lock; on failure, queues the callback
     /// produced by `factory`.
     ///
-    /// This is the raw counterpart of
-    /// [`RwLockBell::try_write_or_else`](crate::RwLockBell::try_write_or_else)
-    /// — the operation `lock_api` has no equivalent for, and the reason to
-    /// reach for this type directly. On `true` the caller owns the exclusive
-    /// lock and must release it exactly once; on `false` nothing was acquired
-    /// and the callback is queued.
+    /// The raw counterpart of
+    /// [`RwLockBell::try_write_or_else`](crate::RwLockBell::try_write_or_else),
+    /// and the reason to reach for this type. On `true` the caller owns the
+    /// exclusive lock and must release it exactly once.
     ///
-    /// The same deadlock and panic rules apply to `factory`: it runs while a
-    /// concurrent unlock waits on it, so it must not touch this lock and must
-    /// not block. And as there, the call itself is not wait-free: it waits out
-    /// any concurrent flush before deciding.
+    /// Same rules as there: `factory` must not touch this lock or block, and
+    /// the call is not wait-free — it waits out any concurrent flush.
     pub fn try_lock_exclusive_or_else<Callback>(&self, factory: impl FnOnce() -> Callback) -> bool
     where
         Callback: FnOnce() + Send + 'static,
     {
-        // Wait while any drain is running, then bump `locking` — both under the
-        // same mutex so the `draining` view can't go stale between the check
-        // and the increment.
+        // Check and bump under one lock, so the `draining` view can't go stale.
         let mut inner = self.state.inner.lock();
 
         while inner.draining > 0 {
@@ -212,8 +204,7 @@ impl RawRwLockBell {
             self.state.decrement_locking();
             true
         } else {
-            // Decrement `locking` even if the factory panics — otherwise
-            // drainers would wait on `locking_zero` forever.
+            // Decrement even if the factory panics, or drainers wait forever.
             let cb = catch_panic(factory, || self.state.decrement_locking());
             let cb: crate::state::Callback = Box::new(cb);
 
@@ -224,11 +215,8 @@ impl RawRwLockBell {
         }
     }
 
-    /// Takes a shared lock **without** touching the bell: no reader accounting,
-    /// and no drain when the returned [`Peek`] is dropped.
-    ///
-    /// Used by [`RwLockBell`](crate::RwLockBell)'s `Debug` impl so that
-    /// formatting a lock can never run a callback, block, or panic.
+    /// Takes a shared lock without touching the bell: no reader accounting, no
+    /// drain on release. Lets `Debug` format a lock without ringing it.
     pub(crate) fn peek(&self) -> Option<Peek<'_>> {
         self.raw.try_lock_shared().then(|| Peek(&self.raw))
     }

@@ -1,10 +1,9 @@
 //! RAII guards for [`RwLockBell`](crate::RwLockBell).
 //!
-//! Every guard is a thin newtype over the corresponding [`lock_api`] guard,
-//! parameterised by `RawRwLockBell`. None of them declares a `Drop` impl:
-//! releasing the lock — and ringing the bell — happens in `RawRwLockBell`,
-//! reached through ordinary drop glue. That is what keeps the `map` family a
-//! plain move instead of a `take`/`forget` dance.
+//! Each is a newtype over the corresponding [`lock_api`] guard. None declares a
+//! `Drop` impl: releasing — and ringing — happens in `RawRwLockBell` via
+//! ordinary drop glue, which keeps the `map` family a plain move rather than a
+//! `take`/`forget` dance.
 //!
 //! |           | borrowed                   | mapped                           | via `Arc` (`arc` feature)  |
 //! |-----------|----------------------------|----------------------------------|----------------------------|

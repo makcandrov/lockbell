@@ -9,8 +9,6 @@ type RawMapped<'a, T> = lock_api::MappedRwLockReadGuard<'a, RawRwLockBell, T>;
 #[cfg(feature = "arc")]
 type RawArc<T> = lock_api::ArcRwLockReadGuard<RawRwLockBell, T>;
 
-// ─── RwLockBellReadGuard ─────────────────────────────────────────────────────
-
 /// RAII shared guard for [`RwLockBell`](crate::RwLockBell).
 ///
 /// Dropping it releases the shared lock and, if this was the last active
@@ -27,8 +25,7 @@ pub struct RwLockBellReadGuard<'a, T: ?Sized>(pub(crate) RawGuard<'a, T>);
 impl<'a, T: ?Sized> RwLockBellReadGuard<'a, T> {
     /// Maps this guard to a component of the protected value.
     ///
-    /// An associated function, not a method, so it cannot shadow a method of
-    /// the same name on `T`.
+    /// An associated function so it cannot shadow a method on `T`.
     pub fn map<U: ?Sized, F>(s: Self, f: F) -> MappedRwLockBellReadGuard<'a, U>
     where
         F: FnOnce(&T) -> &U,
@@ -63,8 +60,6 @@ impl<'a, T: ?Sized> RwLockBellReadGuard<'a, T> {
 }
 
 forward_shared_traits!(RwLockBellReadGuard<'a>);
-
-// ─── MappedRwLockBellReadGuard ───────────────────────────────────────────────
 
 /// RAII shared guard produced by [`RwLockBellReadGuard::map`] and friends.
 ///
@@ -109,13 +104,11 @@ impl<'a, T: ?Sized> MappedRwLockBellReadGuard<'a, T> {
 
 forward_shared_traits!(MappedRwLockBellReadGuard<'a>);
 
-// ─── ArcRwLockBellReadGuard ──────────────────────────────────────────────────
-
 /// Shared guard obtained through an [`Arc`], with no lifetime attached.
 ///
-/// Unlike [`RwLockBellReadGuard`] this holds the [`Arc`] itself rather than a
-/// reference into it, so it keeps the lock's allocation alive on its own and
-/// can be stored in an owning struct without laundering lifetimes.
+/// Holds the [`Arc`] itself rather than a reference into it, so it keeps the
+/// allocation alive and can be stored in an owning struct without laundering
+/// lifetimes.
 ///
 /// Returned by [`RwLockBell::read_arc`] and [`RwLockBell::try_read_arc`].
 ///
