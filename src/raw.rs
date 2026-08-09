@@ -95,18 +95,25 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
 
         let callbacks = {
             let mut inner = self.state.inner.lock();
-            inner.readers -= 1;
-            // Only the last reader drains; skip if another drain is already in flight.
+            // Wrapping here would park `readers` near `u64::MAX` and silently
+            // disable the read-side bell for the rest of the lock's life, so
+            // say so loudly in debug and stay at the floor in release.
+            debug_assert!(inner.readers > 0, "unbalanced unlock_shared");
+            inner.readers = inner.readers.saturating_sub(1);
+            // Only the last reader drains; skip if another drain is already in
+            // flight, since it either has not taken the queue yet (and will
+            // wait for `locking`) or has, in which case the queue is empty and
+            // stays empty until `draining` hits 0.
             if inner.readers > 0
-                || inner.dropping
+                || inner.draining > 0
                 || (inner.callbacks.is_empty() && inner.locking == 0)
             {
                 return;
             }
-            inner.dropping = true;
+            inner.draining += 1;
 
             #[cfg(test)]
-            hooks::run(hooks::HookPoint::ReadGuardAfterSettingDropping);
+            hooks::run(hooks::HookPoint::ReadGuardAfterEnteringDrain);
 
             while inner.locking != 0 {
                 self.state.locking_zero.wait(&mut inner);
@@ -131,10 +138,10 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
 
         let callbacks = {
             let mut inner = self.state.inner.lock();
-            inner.dropping = true;
+            inner.draining += 1;
 
             #[cfg(test)]
-            hooks::run(hooks::HookPoint::WriteGuardAfterSettingDropping);
+            hooks::run(hooks::HookPoint::WriteGuardAfterEnteringDrain);
 
             // Wait until every in-flight `try_write_or` has either pushed its
             // callback or obtained the lock.
@@ -144,6 +151,9 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
             take(&mut inner.callbacks)
             // Mutex released here.
         };
+
+        #[cfg(test)]
+        hooks::run(hooks::HookPoint::WriteGuardBeforeRawUnlock);
 
         // SAFETY: forwarded from this method's own contract.
         unsafe { self.raw.unlock_exclusive() };
@@ -175,21 +185,22 @@ impl RawRwLockBell {
     ///
     /// The same deadlock and panic rules apply to `factory`: it runs while a
     /// concurrent unlock waits on it, so it must not touch this lock and must
-    /// not block.
+    /// not block. And as there, the call itself is not wait-free: it waits out
+    /// any concurrent flush before deciding.
     pub fn try_lock_exclusive_or_else<Callback>(&self, factory: impl FnOnce() -> Callback) -> bool
     where
         Callback: FnOnce() + Send + 'static,
     {
-        // Wait while a drain is running, then bump `locking` — both under the
-        // same mutex so the `dropping` view can't go stale between the check
+        // Wait while any drain is running, then bump `locking` — both under the
+        // same mutex so the `draining` view can't go stale between the check
         // and the increment.
         let mut inner = self.state.inner.lock();
 
-        while inner.dropping {
+        while inner.draining > 0 {
             #[cfg(test)]
-            hooks::run(hooks::HookPoint::TryWriteOrWhileDropping);
+            hooks::run(hooks::HookPoint::TryWriteOrWhileDraining);
 
-            self.state.not_dropping.wait(&mut inner);
+            self.state.not_draining.wait(&mut inner);
         }
         inner.locking += 1;
         drop(inner);

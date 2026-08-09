@@ -36,9 +36,10 @@ use std::{
 /// (including [`Gate::wait`]) may safely call back into [`RwLockBell`][crate::RwLockBell].
 ///
 /// **Exception:** avoid calling `try_write_or` from a hook placed at
-/// [`DrainAfterWriteLockRelease`][HookPoint::DrainAfterWriteLockRelease],
-/// because `dropping` is still `true` at that point and the call will block
-/// until the drain finishes.
+/// [`DrainAfterWriteLockRelease`][HookPoint::DrainAfterWriteLockRelease] or
+/// [`WriteGuardBeforeRawUnlock`][HookPoint::WriteGuardBeforeRawUnlock], because
+/// `draining` is still non-zero at those points and the call will block until
+/// the drain finishes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum HookPoint {
     /// [`try_write_or`][crate::RwLockBell::try_write_or]: the `locking`
@@ -55,38 +56,45 @@ pub enum HookPoint {
     /// the `readers` counter.
     ReadGuardAfterRelease,
 
-    /// `drain_and_run`: the write lock has been dropped, but `dropping` has
-    /// not yet been reset to `false`.
+    /// `drain_and_run`: the lock has been released, but this drain has not yet
+    /// decremented `draining`.
     DrainAfterWriteLockRelease,
 
-    /// `drain_and_run`: `dropping` has been reset to `false` and
-    /// `not_dropping` has been notified, but callbacks have not yet started.
+    /// `drain_and_run`: `draining` has been decremented (and `not_draining`
+    /// notified if it reached 0), but callbacks have not yet started.
     DrainBeforeCallbacks,
 
-    /// `RawRwLockBell::unlock_exclusive`: `dropping` has just been set to
-    /// `true`; the `locking_zero` wait has not yet started.
+    /// `RawRwLockBell::unlock_exclusive`: `draining` has just been bumped; the
+    /// `locking_zero` wait has not yet started.
     ///
     /// **⚠ Called while holding the library's internal state mutex.**
     /// The hook function **must not** block, call any [`RwLockBell`][crate::RwLockBell]
     /// method, or acquire any mutex that could form a cycle with the state
     /// mutex.  Safe operations: [`Gate::signal`], atomic stores, non-blocking
     /// channel sends.
-    WriteGuardAfterSettingDropping,
+    WriteGuardAfterEnteringDrain,
 
-    /// `RawRwLockBell::unlock_shared`: `dropping` has just been set to
-    /// `true` (only fires when this release triggers the drain, i.e. when it
-    /// is the last reader with pending callbacks); the `locking_zero` wait
-    /// has not yet started.
+    /// `RawRwLockBell::unlock_shared`: `draining` has just been bumped (only
+    /// fires when this release triggers the drain, i.e. when it is the last
+    /// reader with pending callbacks or in-flight `try_write_or` calls); the
+    /// `locking_zero` wait has not yet started.
     ///
-    /// Same constraints as [`WriteGuardAfterSettingDropping`].
-    ReadGuardAfterSettingDropping,
+    /// Same constraints as [`WriteGuardAfterEnteringDrain`].
+    ReadGuardAfterEnteringDrain,
 
-    /// `try_write_or_else`: the `while inner.dropping` loop body has been
-    /// entered (i.e. `dropping` is `true`), just before `not_dropping.wait()`.
+    /// `RawRwLockBell::unlock_exclusive`: the callback queue has been taken and
+    /// the state mutex released, but the exclusive lock is **still held**.
+    ///
+    /// This is the window in which an overlapping drain must not reopen the
+    /// `try_write_or` gate.
+    WriteGuardBeforeRawUnlock,
+
+    /// `try_write_or_else`: the `while inner.draining > 0` loop body has been
+    /// entered, just before `not_draining.wait()`.
     ///
     /// **⚠ Called while holding the library's internal state mutex.**
-    /// Same constraints as [`WriteGuardAfterSettingDropping`].
-    TryWriteOrWhileDropping,
+    /// Same constraints as [`WriteGuardAfterEnteringDrain`].
+    TryWriteOrWhileDraining,
 }
 
 // ─── Registry ────────────────────────────────────────────────────────────────

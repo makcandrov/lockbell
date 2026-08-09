@@ -22,7 +22,12 @@ type RawLock<T> = lock_api::RwLock<RawRwLockBell, T>;
 /// queued. All queued callbacks fire in FIFO order, without the firing thread
 /// holding any lock, when the next write guard (or last reader) is dropped.
 ///
+/// A callback is guaranteed to run only if the lock outlives it: dropping the
+/// lock (or calling [`into_inner`]) discards whatever is still queued without
+/// calling it.
+///
 /// [`try_write_or`]: Self::try_write_or
+/// [`into_inner`]: Self::into_inner
 #[repr(transparent)]
 pub struct RwLockBell<T: ?Sized>(RawLock<T>);
 
@@ -137,7 +142,7 @@ impl<T: ?Sized> RwLockBell<T> {
     ///
     /// Callbacks fire in FIFO registration order. A panicking callback does not
     /// prevent the rest of the queue from running; see [`try_write_or_else`]
-    /// for the full panic and deadlock rules, which apply here too.
+    /// for the full blocking, panic and deadlock rules, which apply here too.
     ///
     /// [`try_write_or_else`]: Self::try_write_or_else
     #[inline]
@@ -172,6 +177,21 @@ impl<T: ?Sized> RwLockBell<T> {
     ///
     /// The queued callback itself has no such restriction — it runs after the
     /// lock has been released, and may freely re-acquire it.
+    ///
+    /// # Blocking
+    ///
+    /// Unlike [`try_write`], this is not a wait-free probe. If a guard release
+    /// is concurrently flushing the queue, the call waits for that flush to
+    /// hand back the lock before deciding. That wait is what makes the
+    /// guarantee hold: without it the callback could land in a batch that has
+    /// already been taken, and would never ring at all.
+    ///
+    /// The wait covers only the bell bookkeeping — never the protected data,
+    /// and never a queued callback (those run after the wait is released). It
+    /// does cover any concurrent `factory`, which is the other half of why
+    /// `factory` must not block.
+    ///
+    /// [`try_write`]: Self::try_write
     ///
     /// # Panics
     ///

@@ -81,6 +81,9 @@ works the same whether you hold the lock by reference or by `Arc`.
 - A callback is a notification, not a lock acquisition — the lock may already be re-acquired by the time the callback fires.
 - Callbacks must be `FnOnce() + Send + 'static`.
 - A panicking callback does not prevent subsequent callbacks from running.
+- `try_write_or` is not wait-free despite the name: it waits out a concurrent
+  flush before deciding, so that a callback can never land in a batch that has
+  already been taken. It never waits on the protected data.
 - The *factory* passed to `try_write_or_else` is different: it runs while a
   concurrent unlock is waiting on it, so it must not touch the lock and must
   not block. The callback it returns has no such restriction.

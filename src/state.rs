@@ -21,8 +21,15 @@ pub(crate) type Callback = Box<dyn FnOnce() + Send>;
 
 #[derive(Default)]
 pub(crate) struct LockStateInner {
-    /// A drain is in progress (between setting the flag and flushing callbacks).
-    pub(crate) dropping: bool,
+    /// Drains in progress, counted from committing to a drain to flushing its
+    /// callbacks.
+    ///
+    /// A count rather than a flag: a read-drain and a write-drain can overlap,
+    /// and the write-drain still holds the exclusive lock across its share of
+    /// the window. Clearing on the first one to finish would let a
+    /// `try_write_or_else` queue a callback that the other has already
+    /// snapshotted past — and that callback would never ring.
+    pub(crate) draining: u64,
     /// In-flight `try_write_or_else` calls between bumping the counter and resolving.
     pub(crate) locking: u64,
     /// Live shared-lock count.
@@ -33,7 +40,7 @@ pub(crate) struct LockStateInner {
 
 impl LockStateInner {
     const NEW: Self = Self {
-        dropping: false,
+        draining: 0,
         locking: 0,
         readers: 0,
         callbacks: Vec::new(),
@@ -52,7 +59,7 @@ impl LockStateInner {
 impl Debug for LockStateInner {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Inner")
-            .field("dropping", &self.dropping)
+            .field("draining", &self.draining)
             .field("locking", &self.locking)
             .field("readers", &self.readers)
             .field("callbacks", &"{callbacks}")
@@ -67,8 +74,8 @@ pub(crate) struct LockState {
     pub(crate) inner: Mutex<LockStateInner>,
     /// Signalled when `locking` reaches 0; drainers wait on this.
     pub(crate) locking_zero: Condvar,
-    /// Signalled when `dropping` flips back to `false`; `try_write_or_else` waits on this.
-    pub(crate) not_dropping: Condvar,
+    /// Signalled when `draining` reaches 0; `try_write_or_else` waits on this.
+    pub(crate) not_draining: Condvar,
 }
 
 impl LockState {
@@ -78,7 +85,7 @@ impl LockState {
     pub(crate) const NEW: Self = Self {
         inner: Mutex::new(LockStateInner::NEW),
         locking_zero: Condvar::new(),
-        not_dropping: Condvar::new(),
+        not_draining: Condvar::new(),
     };
 
     pub(crate) fn decrement_locking(&self) {
@@ -100,11 +107,13 @@ impl Debug for LockState {
 
 // ─── draining ────────────────────────────────────────────────────────────────
 
-/// Clears `dropping`, wakes [`try_write_or_else`] waiters, then runs every
-/// callback. Re-raises the first callback panic (if any) once the queue is
-/// fully drained — but only if we aren't already unwinding.
+/// Closes this drain, waking [`try_write_or_else`] waiters once the *last*
+/// concurrent drain is done, then runs every callback. Re-raises the first
+/// callback panic (if any) once the queue is fully drained — but only if we
+/// aren't already unwinding.
 ///
-/// Caller must have set `dropping = true` and taken the callback queue.
+/// Caller must have bumped `draining` and taken the callback queue, and must
+/// already have released the lock it held.
 ///
 /// [`try_write_or_else`]: crate::RwLockBell::try_write_or_else
 pub(crate) fn drain_and_run(state: &LockState, callbacks: Vec<Callback>) {
@@ -113,8 +122,13 @@ pub(crate) fn drain_and_run(state: &LockState, callbacks: Vec<Callback>) {
 
     {
         let mut inner = state.inner.lock();
-        inner.dropping = false;
-        state.not_dropping.notify_all();
+        inner.draining -= 1;
+        // Only the last drain out reopens the gate: an overlapping drain may
+        // still be holding the lock, and a callback queued against it now
+        // would be stranded.
+        if inner.draining == 0 {
+            state.not_draining.notify_all();
+        }
     }
 
     #[cfg(test)]
