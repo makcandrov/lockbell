@@ -5,7 +5,7 @@
 //! # Quick start
 //!
 //! ```ignore
-//! use lock_notify::hooks::{self, Gate, HookPoint, TestGuard};
+//! use crate::tests::hooks::{self, Gate, HookPoint, TestGuard};
 //!
 //! #[test]
 //! fn my_race_test() {
@@ -46,11 +46,11 @@ pub enum HookPoint {
     /// `try_write` has not yet been called.
     TryWriteOrBeforeAcquire,
 
-    /// `Drop for RwLockBellWriteGuard`: called before acquiring the state
+    /// `RawRwLockBell::unlock_exclusive`: called before acquiring the state
     /// mutex to begin the drain sequence.
     WriteGuardBeforeDrop,
 
-    /// `Drop for RwLockBellReadGuard`: the underlying read lock has been
+    /// `RawRwLockBell::unlock_shared`: the underlying read lock has been
     /// released, but the state mutex has not yet been acquired to decrement
     /// the `readers` counter.
     ReadGuardAfterRelease,
@@ -63,7 +63,7 @@ pub enum HookPoint {
     /// `not_dropping` has been notified, but callbacks have not yet started.
     DrainBeforeCallbacks,
 
-    /// `Drop for RwLockBellWriteGuard`: `dropping` has just been set to
+    /// `RawRwLockBell::unlock_exclusive`: `dropping` has just been set to
     /// `true`; the `locking_zero` wait has not yet started.
     ///
     /// **⚠ Called while holding the library's internal state mutex.**
@@ -73,10 +73,10 @@ pub enum HookPoint {
     /// channel sends.
     WriteGuardAfterSettingDropping,
 
-    /// `Drop for RwLockBellReadGuard`: `dropping` has just been set to
-    /// `true` (only fires when this guard triggers the drain, i.e. when it is
-    /// the last reader with pending callbacks); the `locking_zero` wait has
-    /// not yet started.
+    /// `RawRwLockBell::unlock_shared`: `dropping` has just been set to
+    /// `true` (only fires when this release triggers the drain, i.e. when it
+    /// is the last reader with pending callbacks); the `locking_zero` wait
+    /// has not yet started.
     ///
     /// Same constraints as [`WriteGuardAfterSettingDropping`].
     ReadGuardAfterSettingDropping,

@@ -1,6 +1,6 @@
 [package]
 name = "lockbell"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 repository = "https://github.com/makcandrov/lockbell"
@@ -11,5 +11,21 @@ license = "MIT OR Apache-2.0"
 keywords = ["lock", "bell", "rwlock"]
 categories = ["concurrency", "data-structures"]
 
+[features]
+default = ["arc"]
+
+# `Arc`-based guards with no lifetime attached, and the `*_arc` methods that
+# produce them.
+arc = ["parking_lot/arc_lock"]
+
+# Exports `RawRwLockBell`, so it can be used as a `lock_api` raw lock directly.
+# Escape hatch: `lock_api`'s own wrappers ring the bell from operations where
+# `RwLockBell` deliberately does not.
+raw = []
+
 [dependencies]
-parking_lot = "0.12"
+parking_lot = { version = "0.12", default-features = false }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

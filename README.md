@@ -43,12 +43,48 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
 [`try_write_or`]: https://docs.rs/lockbell/latest/lockbell/struct.RwLockBell.html#method.try_write_or
 [`try_write_or_else`]: https://docs.rs/lockbell/latest/lockbell/struct.RwLockBell.html#method.try_write_or_else
 
+## Guards
+
+The bell rings from every guard flavour:
+
+| | borrowed | mapped | via `Arc` |
+|---|---|---|---|
+| shared | `RwLockBellReadGuard<'a, T>` | `MappedRwLockBellReadGuard<'a, T>` | `ArcRwLockBellReadGuard<T>` |
+| exclusive | `RwLockBellWriteGuard<'a, T>` | `MappedRwLockBellWriteGuard<'a, T>` | `ArcRwLockBellWriteGuard<T>` |
+
+The `Arc` guards carry no lifetime: they hold the `Arc<RwLockBell<T>>` itself
+rather than a reference into it, so they can be stored in an owning struct
+without laundering a lifetime to `'static`.
+
+```rust
+# #[cfg(feature = "arc")] {
+use std::sync::Arc;
+use lockbell::{ArcRwLockBellReadGuard, RwLockBell};
+
+// No lifetime attached: keeps the allocation alive on its own.
+struct Owned(ArcRwLockBellReadGuard<Vec<u32>>);
+
+let owned = {
+    let lock = Arc::new(RwLockBell::new(vec![1u32]));
+    Owned(lock.read_arc())
+};
+assert_eq!(owned.0[0], 1);
+# }
+```
+
+`try_write_or` has an `Arc` counterpart too — `try_write_arc_or` — so the bell
+works the same whether you hold the lock by reference or by `Arc`.
+
 ## Callback semantics
 
 - Callbacks run **after** the lock is released, in registration order.
 - A callback is a notification, not a lock acquisition — the lock may already be re-acquired by the time the callback fires.
 - Callbacks must be `FnOnce() + Send + 'static`.
 - A panicking callback does not prevent subsequent callbacks from running.
+- The *factory* passed to `try_write_or_else` is different: it runs while a
+  concurrent unlock is waiting on it, so it must not touch the lock and must
+  not block. The callback it returns has no such restriction.
+- Formatting a lock with `{:?}` never rings the bell.
 
 ## Installation
 

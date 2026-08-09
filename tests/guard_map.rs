@@ -6,14 +6,14 @@ use std::{
     },
 };
 
-use lockbell::RwLockBell;
+use lockbell::{RwLockBell, RwLockBellReadGuard, RwLockBellWriteGuard};
 
 // ─── read guard map ──────────────────────────────────────────────────────────
 
 #[test]
 fn test_map_read_guard() {
     let lock = RwLockBell::new((1u64, 2u64));
-    let mapped = lock.read().map(|t| &t.0);
+    let mapped = RwLockBellReadGuard::map(lock.read(), |t| &t.0);
     assert_eq!(*mapped, 1);
 }
 
@@ -23,7 +23,7 @@ fn test_map_read_guard_fires_callbacks() {
     let called = Arc::new(AtomicBool::new(false));
     let called2 = called.clone();
 
-    let mapped = lock.read().map(|t| &t.1);
+    let mapped = RwLockBellReadGuard::map(lock.read(), |t| &t.1);
     assert!(
         lock.try_write_or(move || called2.store(true, Relaxed))
             .is_none()
@@ -37,7 +37,7 @@ fn test_map_read_guard_fires_callbacks() {
 #[test]
 fn test_try_map_read_guard_success() {
     let lock = RwLockBell::new((1u64, 2u64));
-    let mapped = lock.read().try_map(|t| Some(&t.0));
+    let mapped = RwLockBellReadGuard::try_map(lock.read(), |t| Some(&t.0));
     assert!(mapped.is_ok());
     assert_eq!(*mapped.unwrap(), 1);
 }
@@ -46,7 +46,7 @@ fn test_try_map_read_guard_success() {
 fn test_try_map_read_guard_failure() {
     let lock = RwLockBell::new((1u64, 2u64));
     let r = lock.read();
-    let result = r.try_map(|_| None::<&u64>);
+    let result = RwLockBellReadGuard::try_map(r, |_| None::<&u64>);
     assert!(result.is_err());
     // The original guard is returned.
     let original = result.unwrap_err();
@@ -65,7 +65,7 @@ fn test_try_map_read_guard_failure_still_fires_callbacks() {
             .is_none()
     );
 
-    let result = r.try_map(|_| None::<&u64>);
+    let result = RwLockBellReadGuard::try_map(r, |_| None::<&u64>);
     let original = result.unwrap_err();
     assert!(!called.load(Relaxed), "callback must not fire yet");
     drop(original);
@@ -75,7 +75,7 @@ fn test_try_map_read_guard_failure_still_fires_callbacks() {
 #[test]
 fn test_try_map_or_err_read_guard_success() {
     let lock = RwLockBell::new((1u64, 2u64));
-    let mapped = lock.read().try_map_or_err(|t| Ok::<_, ()>(&t.1));
+    let mapped = RwLockBellReadGuard::try_map_or_err(lock.read(), |t| Ok::<_, ()>(&t.1));
     assert!(mapped.is_ok());
     assert_eq!(*mapped.unwrap(), 2);
 }
@@ -84,7 +84,7 @@ fn test_try_map_or_err_read_guard_success() {
 fn test_try_map_or_err_read_guard_failure() {
     let lock = RwLockBell::new((1u64, 2u64));
     let r = lock.read();
-    let result = r.try_map_or_err(|_| Err::<&u64, _>("oops"));
+    let result = RwLockBellReadGuard::try_map_or_err(r, |_| Err::<&u64, _>("oops"));
     assert!(result.is_err());
     let (original, err) = result.unwrap_err();
     assert_eq!(err, "oops");
@@ -96,7 +96,7 @@ fn test_try_map_or_err_read_guard_failure() {
 #[test]
 fn test_map_write_guard() {
     let lock = RwLockBell::new((1u64, 2u64));
-    let mut mapped = lock.write().map(|t| &mut t.0);
+    let mut mapped = RwLockBellWriteGuard::map(lock.write(), |t| &mut t.0);
     *mapped = 99;
     drop(mapped);
     assert_eq!(lock.read().0, 99);
@@ -108,7 +108,7 @@ fn test_map_write_guard_fires_callbacks() {
     let called = Arc::new(AtomicBool::new(false));
     let called2 = called.clone();
 
-    let mapped = lock.write().map(|t| &mut t.1);
+    let mapped = RwLockBellWriteGuard::map(lock.write(), |t| &mut t.1);
     assert!(
         lock.try_write_or(move || called2.store(true, Relaxed))
             .is_none()
@@ -122,7 +122,7 @@ fn test_map_write_guard_fires_callbacks() {
 #[test]
 fn test_try_map_write_guard_success() {
     let lock = RwLockBell::new((1u64, 2u64));
-    let mapped = lock.write().try_map(|t| Some(&mut t.0));
+    let mapped = RwLockBellWriteGuard::try_map(lock.write(), |t| Some(&mut t.0));
     assert!(mapped.is_ok());
     let mut m = mapped.unwrap();
     *m = 42;
@@ -134,7 +134,7 @@ fn test_try_map_write_guard_success() {
 fn test_try_map_write_guard_failure() {
     let lock = RwLockBell::new((1u64, 2u64));
     let w = lock.write();
-    let result = w.try_map(|_| None::<&mut u64>);
+    let result = RwLockBellWriteGuard::try_map(w, |_| None::<&mut u64>);
     assert!(result.is_err());
     let original = result.unwrap_err();
     assert_eq!(*original, (1, 2));
@@ -152,7 +152,7 @@ fn test_try_map_write_guard_failure_still_fires_callbacks() {
             .is_none()
     );
 
-    let result = w.try_map(|_| None::<&mut u64>);
+    let result = RwLockBellWriteGuard::try_map(w, |_| None::<&mut u64>);
     let original = result.unwrap_err();
     assert!(!called.load(Relaxed));
     drop(original);
@@ -162,7 +162,7 @@ fn test_try_map_write_guard_failure_still_fires_callbacks() {
 #[test]
 fn test_try_map_err_write_guard_success() {
     let lock = RwLockBell::new((1u64, 2u64));
-    let mapped = lock.write().try_map_err(|t| Ok::<_, ()>(&mut t.1));
+    let mapped = RwLockBellWriteGuard::try_map_or_err(lock.write(), |t| Ok::<_, ()>(&mut t.1));
     assert!(mapped.is_ok());
     let mut m = mapped.unwrap();
     assert_eq!(*m, 2);
@@ -175,7 +175,7 @@ fn test_try_map_err_write_guard_success() {
 fn test_try_map_err_write_guard_failure() {
     let lock = RwLockBell::new((1u64, 2u64));
     let w = lock.write();
-    let result = w.try_map_err(|_| Err::<&mut u64, _>("oops"));
+    let result = RwLockBellWriteGuard::try_map_or_err(w, |_| Err::<&mut u64, _>("oops"));
     assert!(result.is_err());
     let (original, err) = result.unwrap_err();
     assert_eq!(err, "oops");
@@ -212,7 +212,9 @@ fn regression_read_map_panic_does_not_leak_readers() {
 
     let r = lock.read();
     let result = panic::catch_unwind(AssertUnwindSafe(move || {
-        let _ = r.map(|_| -> &u64 { panic!("intentional panic in map closure") });
+        let _ = RwLockBellReadGuard::map(r, |_| -> &u64 {
+            panic!("intentional panic in map closure")
+        });
     }));
     assert!(result.is_err(), "panic must propagate to caller");
 
@@ -241,7 +243,9 @@ fn regression_read_try_map_panic_does_not_leak_readers() {
 
     let r = lock.read();
     let result = panic::catch_unwind(AssertUnwindSafe(move || {
-        let _ = r.try_map(|_| -> Option<&u64> { panic!("intentional") });
+        drop(RwLockBellReadGuard::try_map(r, |_| -> Option<&u64> {
+            panic!("intentional")
+        }));
     }));
     assert!(result.is_err());
 
@@ -266,7 +270,10 @@ fn regression_read_try_map_or_err_panic_does_not_leak_readers() {
 
     let r = lock.read();
     let result = panic::catch_unwind(AssertUnwindSafe(move || {
-        let _ = r.try_map_or_err(|_| -> Result<&u64, ()> { panic!("intentional") });
+        drop(RwLockBellReadGuard::try_map_or_err(
+            r,
+            |_| -> Result<&u64, ()> { panic!("intentional") },
+        ));
     }));
     assert!(result.is_err());
 
@@ -300,7 +307,7 @@ fn regression_write_map_panic_drains_pending_callbacks() {
     );
 
     let result = panic::catch_unwind(AssertUnwindSafe(move || {
-        let _ = w.map(|_| -> &mut u64 { panic!("intentional") });
+        let _ = RwLockBellWriteGuard::map(w, |_| -> &mut u64 { panic!("intentional") });
     }));
     assert!(result.is_err());
 
@@ -326,7 +333,9 @@ fn regression_write_try_map_panic_drains_pending_callbacks() {
     );
 
     let result = panic::catch_unwind(AssertUnwindSafe(move || {
-        let _ = w.try_map(|_| -> Option<&mut u64> { panic!("intentional") });
+        drop(RwLockBellWriteGuard::try_map(w, |_| -> Option<&mut u64> {
+            panic!("intentional")
+        }));
     }));
     assert!(result.is_err());
 
@@ -349,7 +358,10 @@ fn regression_write_try_map_err_panic_drains_pending_callbacks() {
     );
 
     let result = panic::catch_unwind(AssertUnwindSafe(move || {
-        let _ = w.try_map_err(|_| -> Result<&mut u64, ()> { panic!("intentional") });
+        drop(RwLockBellWriteGuard::try_map_or_err(
+            w,
+            |_| -> Result<&mut u64, ()> { panic!("intentional") },
+        ));
     }));
     assert!(result.is_err());
 

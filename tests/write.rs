@@ -10,12 +10,11 @@ use std::{
 };
 
 use lockbell::RwLockBell;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
 #[test]
 fn test_callback() {
-    let lock = RwLock::new(12u64);
-    let lock_callback = Arc::new(RwLockBell::from_lock(lock));
+    let lock_callback = Arc::new(RwLockBell::new(12u64));
 
     let step = Arc::new(AtomicU64::new(0));
     let callback_allowed = Arc::new(AtomicBool::new(false));
@@ -68,7 +67,7 @@ fn test_multiple_callbacks() {
 
     for i in 0..5u64 {
         let order = order.clone();
-        let _ = lock.try_write_or(move || order.lock().push(i));
+        drop(lock.try_write_or(move || order.lock().push(i)));
     }
 
     drop(guard);
@@ -81,9 +80,9 @@ fn test_callback_can_call_try_write() {
     let lock2 = lock.clone();
 
     let guard = lock.try_write_or(|| {}).unwrap();
-    let _ = lock.try_write_or(move || {
-        let _ = lock2.try_write_or(|| {});
-    });
+    drop(lock.try_write_or(move || {
+        drop(lock2.try_write_or(|| {}));
+    }));
     drop(guard);
 }
 
@@ -95,7 +94,7 @@ fn test_write_triggers_callbacks() {
     let called2 = called.clone();
 
     let guard = lock.write();
-    let _ = lock.try_write_or(move || called2.store(true, Relaxed));
+    drop(lock.try_write_or(move || called2.store(true, Relaxed)));
     drop(guard);
 
     assert!(called.load(Relaxed));
@@ -109,8 +108,8 @@ fn test_callback_panic_does_not_skip_subsequent() {
     let called2 = called.clone();
 
     let guard = lock.try_write().unwrap();
-    let _ = lock.try_write_or(|| panic!("intentional panic in callback"));
-    let _ = lock.try_write_or(move || called2.store(true, Relaxed));
+    drop(lock.try_write_or(|| panic!("intentional panic in callback")));
+    drop(lock.try_write_or(move || called2.store(true, Relaxed)));
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| drop(guard)));
     assert!(result.is_err(), "panic should have been re-raised");
@@ -136,9 +135,9 @@ fn test_callback_sees_updated_value() {
 
     let mut guard = lock.write();
     *guard = 99;
-    let _ = lock.try_write_or(move || {
+    drop(lock.try_write_or(move || {
         seen2.store(*lock2.read(), Relaxed);
-    });
+    }));
     drop(guard);
 
     assert_eq!(seen.load(Relaxed), 99);
@@ -190,9 +189,9 @@ fn regression_try_write_or_else_factory_panic_does_not_leak_locking() {
     // Panicking factory; catch the panic.
     let lock2 = lock.clone();
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let _ = lock2.try_write_or_else(|| -> fn() {
+        drop(lock2.try_write_or_else(|| -> fn() {
             panic!("factory panic");
-        });
+        }));
     }));
     assert!(result.is_err(), "factory panic must propagate to caller");
 
@@ -242,7 +241,7 @@ fn regression_no_abort_when_callback_panics_during_user_unwind() {
     let lock2 = lock.clone();
     let result = panic::catch_unwind(AssertUnwindSafe(move || {
         let _guard = lock2.write();
-        let _ = lock2.try_write_or(|| panic!("callback panic during unwind"));
+        drop(lock2.try_write_or(|| panic!("callback panic during unwind")));
         // _guard is dropped as part of unwinding from this panic. The drop
         // fires the queued callback, which panics. Without the fix the
         // double-panic aborts the process and this test never returns.
@@ -273,7 +272,7 @@ fn regression_no_abort_when_callback_panics_during_user_unwind() {
 fn callback_panic_still_propagates_when_no_outer_panic() {
     let lock = Arc::new(RwLockBell::new(0u64));
     let guard = lock.write();
-    let _ = lock.try_write_or(|| panic!("callback panic"));
+    drop(lock.try_write_or(|| panic!("callback panic")));
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| drop(guard)));
     assert!(

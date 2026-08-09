@@ -40,7 +40,7 @@ fn test_in_flight_try_write_or_collected_by_write_guard_drain() {
     let lock_b = lock.clone();
     let called_b = called.clone();
     let t_b = thread::spawn(move || {
-        let _ = lock_b.try_write_or(move || called_b.store(true, Relaxed));
+        drop(lock_b.try_write_or(move || called_b.store(true, Relaxed)));
     });
 
     gate.wait_for_arrival(); // B is paused (locking=1, before try_write)
@@ -317,7 +317,7 @@ fn test_while_dropping_loop_is_entered() {
     let b_proceeded = Arc::new(AtomicBool::new(false));
     let bp2 = b_proceeded.clone();
     let t_b = thread::spawn(move || {
-        let _ = lock_b.try_write_or(|| {});
+        drop(lock_b.try_write_or(|| {}));
         bp2.store(true, Relaxed);
     });
 
@@ -375,7 +375,7 @@ fn test_write_guard_locking_zero_wait_is_entered() {
     let lock_b = lock.clone();
     let called_b = called.clone();
     let t_b = thread::spawn(move || {
-        let _ = lock_b.try_write_or(move || called_b.store(true, Relaxed));
+        drop(lock_b.try_write_or(move || called_b.store(true, Relaxed)));
     });
 
     gate_b.wait_for_arrival(); // B is paused; locking=1
@@ -436,7 +436,7 @@ fn test_callbacks_run_after_dropping_is_reset() {
     assert!(
         lock.try_write_or(move || {
             // Also verify from inside the callback itself.
-            let _ = lock3.try_write_or(|| {});
+            drop(lock3.try_write_or(|| {}));
             cr2.store(true, Relaxed);
         })
         .is_none()
@@ -588,7 +588,7 @@ fn regression_double_drain_no_deadlock() {
     let t_fired = Arc::new(AtomicBool::new(false));
     let tf2 = t_fired.clone();
     let t_handle = thread::spawn(move || {
-        let _ = lock_t.try_write_or(move || tf2.store(true, Relaxed));
+        drop(lock_t.try_write_or(move || tf2.store(true, Relaxed)));
     });
     gate_t.wait_for_arrival();
     hooks::clear(HookPoint::TryWriteOrBeforeAcquire);

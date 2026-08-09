@@ -62,9 +62,9 @@ fn test_try_write_or_races_last_read_guard_drop() {
         let called2 = called.clone();
 
         let handle = thread::spawn(move || {
-            let _ = lock2.try_write_or(move || {
+            drop(lock2.try_write_or(move || {
                 called2.fetch_add(1, Relaxed);
-            });
+            }));
         });
 
         drop(r);
@@ -213,9 +213,9 @@ fn test_in_flight_try_write_or_observed_by_drain() {
         let called2 = called.clone();
 
         let handle = thread::spawn(move || {
-            let _ = lock2.try_write_or(move || {
+            drop(lock2.try_write_or(move || {
                 called2.fetch_add(1, Relaxed);
-            });
+            }));
         });
 
         drop(r);
@@ -359,9 +359,9 @@ fn test_alternating_read_write_no_lost_callbacks() {
 
         // Alternate: even iterations use read guard, odd use write guard.
         let r = lock.read();
-        let _ = lock.try_write_or(move || {
+        drop(lock.try_write_or(move || {
             c.fetch_add(1, Relaxed);
-        });
+        }));
 
         drop(r);
     }
