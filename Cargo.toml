@@ -11,12 +11,12 @@ license = "MIT OR Apache-2.0"
 keywords = ["lock", "bell", "rwlock"]
 categories = ["concurrency", "data-structures"]
 
-[features]
-arc_lock = ["parking_lot/arc_lock"]
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 parking_lot = { version = "0.12.5", default-features = false }
 
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
+[features]
+arc_lock = ["parking_lot/arc_lock"]
