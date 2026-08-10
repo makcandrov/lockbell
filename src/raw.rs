@@ -2,15 +2,16 @@
 
 use std::{fmt::Debug, mem::take};
 
-use parking_lot::lock_api::RawRwLock as _;
-use parking_lot::{RawRwLock, lock_api};
+use parking_lot::lock_api::RawRwLock;
 
 use crate::state::{LockState, catch_panic, drain_and_run};
 #[cfg(test)]
 use crate::tests::hooks;
 
-/// The [`lock_api::RawRwLock`] behind [`RwLockBell`](crate::RwLockBell):
-/// [`parking_lot::RawRwLock`] plus the callback queue.
+/// The [`RawRwLock`] behind [`RwLockBell`](crate::RwLockBell): a raw
+/// reader-writer lock `R` plus the callback queue.
+///
+/// `R` defaults to [`parking_lot::RawRwLock`], which is what `RwLockBell` uses.
 ///
 /// # Using it directly
 ///
@@ -19,6 +20,22 @@ use crate::tests::hooks;
 /// `force_unlock_read` / `force_unlock_write` all release a lock, so they run
 /// queued callbacks — and can therefore block and panic.
 ///
+/// # Requirements on `R`
+///
+/// [`RawRwLock`] alone is not enough. Substituting your own `R` also means:
+///
+/// - **Its acquire and release methods must not unwind.** Each runs with bell
+///   bookkeeping already committed, so a panic strands `readers`, `locking` or
+///   `draining` above zero and wedges the bell permanently: callbacks queue and
+///   never ring, or every later drain blocks forever.
+/// - **[`try_lock_shared`] and [`unlock_shared`] must not block or re-enter
+///   this lock.** Both are called with the bell's own mutex held.
+/// - **[`GuardMarker`] is `R`'s.** A `GuardSend` lock yields `Send` guards, so
+///   the release — and with it the whole callback batch — can run on a thread
+///   that never acquired.
+///
+/// [`parking_lot::RawRwLock`] satisfies all three.
+///
 /// # Extending it
 ///
 /// Do **not** implement [`RawRwLockFair`], [`RawRwLockDowngrade`],
@@ -26,24 +43,26 @@ use crate::tests::hooks;
 /// bypasses [`lock_shared`]/[`unlock_shared`], so `unlock_shared_fair` would
 /// leak a reader and `unlock_exclusive_fair` would skip the drain.
 ///
-/// [`RawRwLockFair`]: lock_api::RawRwLockFair
-/// [`RawRwLockDowngrade`]: lock_api::RawRwLockDowngrade
-/// [`RawRwLockRecursive`]: lock_api::RawRwLockRecursive
-/// [`RawRwLockUpgrade`]: lock_api::RawRwLockUpgrade
-/// [`lock_shared`]: lock_api::RawRwLock::lock_shared
-/// [`unlock_shared`]: lock_api::RawRwLock::unlock_shared
-pub struct RawRwLockBell {
-    raw: RawRwLock,
+/// [`RawRwLockFair`]: parking_lot::lock_api::RawRwLockFair
+/// [`RawRwLockDowngrade`]: parking_lot::lock_api::RawRwLockDowngrade
+/// [`RawRwLockRecursive`]: parking_lot::lock_api::RawRwLockRecursive
+/// [`RawRwLockUpgrade`]: parking_lot::lock_api::RawRwLockUpgrade
+/// [`GuardMarker`]: parking_lot::lock_api::RawRwLock::GuardMarker
+/// [`lock_shared`]: parking_lot::lock_api::RawRwLock::lock_shared
+/// [`try_lock_shared`]: parking_lot::lock_api::RawRwLock::try_lock_shared
+/// [`unlock_shared`]: parking_lot::lock_api::RawRwLock::unlock_shared
+pub struct RawRwLockBell<R = parking_lot::RawRwLock> {
+    raw: R,
     state: LockState,
 }
 
-impl Default for RawRwLockBell {
+impl<R: RawRwLock> Default for RawRwLockBell<R> {
     fn default() -> Self {
-        <Self as lock_api::RawRwLock>::INIT
+        <Self as RawRwLock>::INIT
     }
 }
 
-impl Debug for RawRwLockBell {
+impl<R: RawRwLock> Debug for RawRwLockBell<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RawRwLockBell")
             .field("locked", &self.raw.is_locked())
@@ -54,13 +73,13 @@ impl Debug for RawRwLockBell {
 
 // SAFETY: every method forwards its locking obligation to `self.raw`. The bell
 // bookkeeping never grants or releases access to the protected data.
-unsafe impl lock_api::RawRwLock for RawRwLockBell {
+unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
     const INIT: Self = Self {
-        raw: <RawRwLock as lock_api::RawRwLock>::INIT,
+        raw: <R as RawRwLock>::INIT,
         state: LockState::NEW,
     };
 
-    type GuardMarker = <RawRwLock as lock_api::RawRwLock>::GuardMarker;
+    type GuardMarker = <R as RawRwLock>::GuardMarker;
 
     fn lock_shared(&self) {
         // Counted before acquiring, so no window exists in which we hold the
@@ -183,7 +202,7 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
     }
 }
 
-impl RawRwLockBell {
+impl<R: RawRwLock> RawRwLockBell<R> {
     /// Attempts to acquire the exclusive lock; on failure, queues the callback
     /// produced by `factory`.
     ///
@@ -230,15 +249,15 @@ impl RawRwLockBell {
 
     /// Takes a shared lock without touching the bell: no reader accounting, no
     /// drain on release. Lets `Debug` format a lock without ringing it.
-    pub(crate) fn peek(&self) -> Option<Peek<'_>> {
+    pub(crate) fn peek(&self) -> Option<Peek<'_, R>> {
         self.raw.try_lock_shared().then(|| Peek(&self.raw))
     }
 }
 
 /// Holds a bell-free shared lock for as long as it lives.
-pub(crate) struct Peek<'a>(&'a RawRwLock);
+pub(crate) struct Peek<'a, R: RawRwLock>(&'a R);
 
-impl Drop for Peek<'_> {
+impl<R: RawRwLock> Drop for Peek<'_, R> {
     fn drop(&mut self) {
         // SAFETY: only constructed after a successful `try_lock_shared`.
         unsafe { self.0.unlock_shared() };

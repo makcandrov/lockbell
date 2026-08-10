@@ -1,10 +1,8 @@
-//! The `raw` escape hatch.
+//! The escape hatch.
 //!
 //! `RawRwLockBell` lets you drive the bell through `lock_api` directly. That
 //! also reinstates the operations `RwLockBell` deliberately keeps away from it,
-//! so these tests pin what you are opting into.
-
-#![cfg(feature = "raw")]
+//! so these tests pin what reaching for it costs.
 
 use std::sync::{
     Arc,

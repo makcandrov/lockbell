@@ -18,13 +18,8 @@ default = ["arc"]
 # produce them.
 arc = ["parking_lot/arc_lock"]
 
-# Exports `RawRwLockBell`, so it can be used as a `lock_api` raw lock directly.
-# Escape hatch: `lock_api`'s own wrappers ring the bell from operations where
-# `RwLockBell` deliberately does not.
-raw = []
-
 [dependencies]
-parking_lot = { version = "0.12", default-features = false }
+parking_lot = { version = "0.12.5", default-features = false }
 
 [package.metadata.docs.rs]
 all-features = true

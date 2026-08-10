@@ -71,11 +71,6 @@ lockbell = "0.2"
   hold the `Arc<RwLockBell<T>>` itself rather than a reference into it, so they
   can be stored in an owning struct without laundering a lifetime to `'static`.
   Enables `parking_lot/arc_lock`.
-- **`raw`** — exports `RawRwLockBell`, so it can be used as a `lock_api` raw
-  lock directly. An escape hatch: in a bare `lock_api::RwLock<RawRwLockBell, T>`
-  the `Debug` impl and `force_unlock_read` / `force_unlock_write` all release a
-  lock, so they ring the bell — and can therefore block and panic. `RwLockBell`
-  exists to keep those operations away from it.
 
 ## Use cases
 

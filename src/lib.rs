@@ -14,10 +14,8 @@ pub use guard::{
     MappedRwLockBellReadGuard, MappedRwLockBellWriteGuard, RwLockBellReadGuard,
     RwLockBellWriteGuard,
 };
+pub use raw::RawRwLockBell;
 pub use rwlock::RwLockBell;
 
 #[cfg(feature = "arc")]
 pub use guard::{ArcRwLockBellReadGuard, ArcRwLockBellWriteGuard};
-
-#[cfg(feature = "raw")]
-pub use raw::RawRwLockBell;

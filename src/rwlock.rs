@@ -10,8 +10,9 @@ use parking_lot::lock_api;
 use crate::{ArcRwLockBellReadGuard, ArcRwLockBellWriteGuard};
 use crate::{RwLockBellReadGuard, RwLockBellWriteGuard, raw::RawRwLockBell};
 
-/// Kept private: exposing it would put every `lock_api` operation — including
-/// the ones that ring the bell unexpectedly — back into the public API.
+/// Wrapped rather than aliased, so `RwLockBell` exposes only the operations
+/// below — not every `lock_api` one, including those that ring the bell
+/// unexpectedly. Spelling this type out is the opt-in for those.
 type RawLock<T> = lock_api::RwLock<RawRwLockBell, T>;
 
 /// An [`RwLock`](parking_lot::RwLock) that fires queued callbacks when
