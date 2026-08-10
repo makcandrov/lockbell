@@ -1,6 +1,6 @@
 //! Guards and callbacks obtained through an `Arc`, with no lifetime attached.
 
-#![cfg(feature = "arc")]
+#![cfg(feature = "arc_lock")]
 
 use std::sync::Arc;
 

@@ -6,7 +6,7 @@ use crate::raw::RawRwLockBell;
 
 type RawGuard<'a, T> = lock_api::RwLockWriteGuard<'a, RawRwLockBell, T>;
 type RawMapped<'a, T> = lock_api::MappedRwLockWriteGuard<'a, RawRwLockBell, T>;
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 type RawArc<T> = lock_api::ArcRwLockWriteGuard<RawRwLockBell, T>;
 
 /// RAII exclusive guard for [`RwLockBell`](crate::RwLockBell).
@@ -118,12 +118,12 @@ forward_mut_traits!(MappedRwLockBellWriteGuard<'a>);
 /// [`RwLockBell::write_arc`]: crate::RwLockBell::write_arc
 /// [`RwLockBell::try_write_arc`]: crate::RwLockBell::try_write_arc
 /// [`RwLockBell::try_write_arc_or`]: crate::RwLockBell::try_write_arc_or
-#[cfg(feature = "arc")]
-#[cfg_attr(docsrs, doc(cfg(feature = "arc")))]
+#[cfg(feature = "arc_lock")]
+#[cfg_attr(docsrs, doc(cfg(feature = "arc_lock")))]
 #[must_use = "if unused the lock is immediately released"]
 pub struct ArcRwLockBellWriteGuard<T: ?Sized>(pub(crate) RawArc<T>);
 
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 forward_shared_traits!(ArcRwLockBellWriteGuard);
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 forward_mut_traits!(ArcRwLockBellWriteGuard);

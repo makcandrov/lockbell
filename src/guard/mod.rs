@@ -56,7 +56,7 @@ mod write;
 pub use read::{MappedRwLockBellReadGuard, RwLockBellReadGuard};
 pub use write::{MappedRwLockBellWriteGuard, RwLockBellWriteGuard};
 
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 pub use read::ArcRwLockBellReadGuard;
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 pub use write::ArcRwLockBellWriteGuard;

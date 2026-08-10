@@ -38,7 +38,7 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
 - a write guard is dropped, or
 - the last active read guard is dropped (if callbacks were queued while readers held the lock).
 
-[`try_write_or_else`] is also available when constructing the callback is expensive and should only happen on contention.
+[`try_write_or_else`] builds the callback only on contention, so the success path skips the setup entirely. Keep the factory itself cheap and leave any expensive work to the callback it returns — see below.
 
 [`try_write_or`]: https://docs.rs/lockbell/latest/lockbell/struct.RwLockBell.html#method.try_write_or
 [`try_write_or_else`]: https://docs.rs/lockbell/latest/lockbell/struct.RwLockBell.html#method.try_write_or_else
@@ -54,7 +54,9 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
   already been taken. It never waits on the protected data.
 - The *factory* passed to `try_write_or_else` is different: it runs while a
   concurrent unlock is waiting on it, so it must not touch the lock and must
-  not block. The callback it returns has no such restriction.
+  not block. The callback it returns has no such restriction, so expensive
+  construction belongs there rather than in the factory. `try_write_or` takes
+  an already-built callback and so runs no code of yours in that window at all.
 - Formatting a lock with `{:?}` never rings the bell.
 
 ## Installation
@@ -66,7 +68,7 @@ lockbell = "0.2"
 
 ## Features
 
-- **`arc`** *(default)* — `Arc`-based guards that carry no lifetime, and the
+- **`arc_lock`** — `Arc`-based guards that carry no lifetime, and the
   `read_arc` / `write_arc` / `try_write_arc_or` family that produces them. They
   hold the `Arc<RwLockBell<T>>` itself rather than a reference into it, so they
   can be stored in an owning struct without laundering a lifetime to `'static`.

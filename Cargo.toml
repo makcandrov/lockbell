@@ -12,11 +12,7 @@ keywords = ["lock", "bell", "rwlock"]
 categories = ["concurrency", "data-structures"]
 
 [features]
-default = ["arc"]
-
-# `Arc`-based guards with no lifetime attached, and the `*_arc` methods that
-# produce them.
-arc = ["parking_lot/arc_lock"]
+arc_lock = ["parking_lot/arc_lock"]
 
 [dependencies]
 parking_lot = { version = "0.12.5", default-features = false }

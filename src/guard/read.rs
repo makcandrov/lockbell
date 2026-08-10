@@ -6,7 +6,7 @@ use crate::raw::RawRwLockBell;
 
 type RawGuard<'a, T> = lock_api::RwLockReadGuard<'a, RawRwLockBell, T>;
 type RawMapped<'a, T> = lock_api::MappedRwLockReadGuard<'a, RawRwLockBell, T>;
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 type RawArc<T> = lock_api::ArcRwLockReadGuard<RawRwLockBell, T>;
 
 /// RAII shared guard for [`RwLockBell`](crate::RwLockBell).
@@ -115,10 +115,10 @@ forward_shared_traits!(MappedRwLockBellReadGuard<'a>);
 /// [`Arc`]: std::sync::Arc
 /// [`RwLockBell::read_arc`]: crate::RwLockBell::read_arc
 /// [`RwLockBell::try_read_arc`]: crate::RwLockBell::try_read_arc
-#[cfg(feature = "arc")]
-#[cfg_attr(docsrs, doc(cfg(feature = "arc")))]
+#[cfg(feature = "arc_lock")]
+#[cfg_attr(docsrs, doc(cfg(feature = "arc_lock")))]
 #[must_use = "if unused the lock is immediately released"]
 pub struct ArcRwLockBellReadGuard<T: ?Sized>(pub(crate) RawArc<T>);
 
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 forward_shared_traits!(ArcRwLockBellReadGuard);

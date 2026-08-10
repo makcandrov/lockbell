@@ -1,12 +1,12 @@
 //! The lock itself.
 
 use std::fmt;
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 use std::{mem::ManuallyDrop, sync::Arc};
 
 use parking_lot::lock_api;
 
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 use crate::{ArcRwLockBellReadGuard, ArcRwLockBellWriteGuard};
 use crate::{RwLockBellReadGuard, RwLockBellWriteGuard, raw::RawRwLockBell};
 
@@ -138,9 +138,13 @@ impl<T: ?Sized> RwLockBell<T> {
     ///   firing thread holding no lock, after the next write guard (or last
     ///   reader) is dropped.
     ///
-    /// Callbacks fire in FIFO registration order. A panicking callback does not
-    /// prevent the rest of the queue from running; see [`try_write_or_else`]
-    /// for the full blocking, panic and deadlock rules, which apply here too.
+    /// Callbacks fire in FIFO registration order, sharing one queue with
+    /// [`try_write_or_else`]. A panicking callback does not prevent the rest of
+    /// the queue from running; see there for the blocking and callback-panic
+    /// rules, which apply here too.
+    ///
+    /// Its deadlock rule does not: `callback` is already built, so none of your
+    /// code runs inside the window a concurrent unlock waits on.
     ///
     /// [`try_write_or_else`]: Self::try_write_or_else
     #[inline]
@@ -178,7 +182,10 @@ impl<T: ?Sized> RwLockBell<T> {
     /// ```
     ///
     /// The queued callback has no such restriction: it runs after the release
-    /// and may freely re-acquire the lock.
+    /// and may freely re-acquire the lock. So when construction is genuinely
+    /// expensive, keep `factory` to the cheap conditional part and leave the
+    /// expensive work to the callback. [`try_write_or`], having no factory, is
+    /// free of all of this.
     ///
     /// # Blocking
     ///
@@ -221,8 +228,8 @@ impl<T: ?Sized> RwLockBell<T> {
     }
 }
 
-#[cfg(feature = "arc")]
-#[cfg_attr(docsrs, doc(cfg(feature = "arc")))]
+#[cfg(feature = "arc_lock")]
+#[cfg_attr(docsrs, doc(cfg(feature = "arc_lock")))]
 impl<T: ?Sized> RwLockBell<T> {
     /// Locks for shared access through an [`Arc`], blocking until acquired.
     ///
@@ -356,7 +363,7 @@ impl<T: ?Sized> RwLockBell<T> {
     /// Borrows `Arc<Self>` as `Arc<RawLock<T>>`, which is all `lock_api`'s
     /// `Arc`-guard constructors accept. They clone it themselves, so exactly
     /// one strong count is added per guard.
-    #[cfg(feature = "arc")]
+    #[cfg(feature = "arc_lock")]
     #[inline]
     fn as_raw_arc(self: &Arc<Self>) -> ManuallyDrop<Arc<RawLock<T>>> {
         let ptr = Arc::as_ptr(self) as *const RawLock<T>;

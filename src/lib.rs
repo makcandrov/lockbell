@@ -17,5 +17,5 @@ pub use guard::{
 pub use raw::RawRwLockBell;
 pub use rwlock::RwLockBell;
 
-#[cfg(feature = "arc")]
+#[cfg(feature = "arc_lock")]
 pub use guard::{ArcRwLockBellReadGuard, ArcRwLockBellWriteGuard};
