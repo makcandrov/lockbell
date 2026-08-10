@@ -48,14 +48,18 @@ pub enum HookPoint {
     /// `drain_and_run`: `draining` decremented, before the callbacks run.
     DrainBeforeCallbacks,
 
-    /// ⚠ `unlock_exclusive`: `draining` bumped, before the `locking_zero` wait.
+    /// `unlock_exclusive`: `draining` bumped, before the `locking_zero` wait.
     WriteGuardAfterEnteringDrain,
 
-    /// ⚠ `unlock_shared`: same, and only when this release triggers the drain.
+    /// `unlock_shared`: same, and only when this release triggers the drain.
     ReadGuardAfterEnteringDrain,
 
-    /// ⚠ `try_write_or_else`: inside the `draining > 0` loop, before the wait.
+    /// `try_write_or_else`: inside the `draining > 0` loop, before the wait.
     TryWriteOrWhileDraining,
+
+    /// `unlock_shared`: non-draining branch, shared lock still held and the
+    /// state mutex still taken. Anything reaching for the bell blocks here.
+    ReadGuardBeforeSkippedDrainUnlock,
 }
 
 type HookFn = Arc<dyn Fn() + Send + Sync + 'static>;

@@ -675,3 +675,99 @@ fn regression_overlapping_drains_do_not_strand_callbacks() {
         "every registered callback must have rung"
     );
 }
+
+// ─── regression: a reader that skips the drain must not open a window ────────
+
+/// A reader that decides *not* to drain must release the raw lock under the
+/// state mutex.
+///
+/// It used to drop the mutex first, leaving a window in which it still held the
+/// shared lock having already declined to drain. A `try_write_or` landing there
+/// failed against that lock and queued — with nobody left to ring it. The lock
+/// went free moments later and the callback was stranded for good.
+///
+/// Neither guard in the branch covers that: the drain we deferred to can finish
+/// inside the window, and the queue we found empty can be filled inside it.
+///
+/// R parks mid-release with the drain declined, and T must not get past the
+/// bell bookkeeping until R is fully out.
+#[test]
+fn regression_skipped_read_drain_releases_under_the_mutex() {
+    let _g = TestGuard::acquire();
+    let lock = Arc::new(RwLockBell::new(0u64));
+    let fired = Arc::new(AtomicBool::new(false));
+    let t_decided = Arc::new(AtomicBool::new(false));
+    let t_queued = Arc::new(AtomicBool::new(false));
+
+    // Queue empty and locking == 0, so dropping `r` takes the non-draining
+    // branch rather than the drain.
+    let r = lock.read();
+
+    let r_parked = Gate::new();
+    let r_release = Gate::new();
+    let rp2 = r_parked.clone();
+    let rr2 = r_release.clone();
+    hooks::set(HookPoint::ReadGuardBeforeSkippedDrainUnlock, move || {
+        hooks::clear(HookPoint::ReadGuardBeforeSkippedDrainUnlock); // one-shot
+        rp2.signal();
+        rr2.wait();
+    });
+
+    let lock_t = lock.clone();
+    let fired_t = fired.clone();
+    let td2 = t_decided.clone();
+    let tq2 = t_queued.clone();
+    let orchestrator = thread::spawn(move || {
+        r_parked.wait_for_arrival(); // R declined the drain, still holds
+
+        let t_handle = thread::spawn(move || {
+            let got = lock_t.try_write_or(move || fired_t.store(true, Relaxed));
+            tq2.store(got.is_none(), Relaxed);
+            td2.store(true, Relaxed);
+            drop(got);
+        });
+
+        // T must still be blocked on the state mutex: with the old ordering it
+        // would already have failed against R and queued into nothing. Sampled
+        // before releasing R, so a failure reports rather than deadlocks.
+        thread::sleep(Duration::from_millis(100));
+        let decided_early = t_decided.load(Relaxed);
+
+        r_release.open();
+        t_handle.join().unwrap();
+        decided_early
+    });
+
+    let watchdog_stop = Arc::new(AtomicBool::new(false));
+    let watchdog_stop2 = watchdog_stop.clone();
+    let watchdog = thread::spawn(move || {
+        for _ in 0..100 {
+            if watchdog_stop2.load(Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("[regression_skipped_read_drain_releases_under_the_mutex] WATCHDOG fired");
+        std::process::abort();
+    });
+
+    drop(r); // parks in the hook
+
+    let decided_early = orchestrator.join().unwrap();
+    watchdog_stop.store(true, Relaxed);
+    watchdog.join().unwrap();
+
+    assert!(
+        !decided_early,
+        "a try_write_or resolved while a reader was mid-release having declined to drain"
+    );
+    assert!(!lock.is_locked(), "every guard is gone");
+    assert!(
+        !t_queued.load(Relaxed) || fired.load(Relaxed),
+        "a queued callback was stranded"
+    );
+    assert!(
+        !t_queued.load(Relaxed),
+        "T saw a free lock, so it must have taken it outright"
+    );
+}

@@ -55,7 +55,6 @@ impl Debug for RawRwLockBell {
 // SAFETY: every method forwards its locking obligation to `self.raw`. The bell
 // bookkeeping never grants or releases access to the protected data.
 unsafe impl lock_api::RawRwLock for RawRwLockBell {
-    #[allow(clippy::declare_interior_mutable_const)]
     const INIT: Self = Self {
         raw: <RawRwLock as lock_api::RawRwLock>::INIT,
         state: LockState::NEW,
@@ -64,13 +63,18 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
     type GuardMarker = <RawRwLock as lock_api::RawRwLock>::GuardMarker;
 
     fn lock_shared(&self) {
-        self.raw.lock_shared();
+        // Counted before acquiring, so no window exists in which we hold the
+        // lock uncounted and another reader's release mistakes itself for the
+        // last one. Counting a waiter early only ever defers a drain to us.
         self.state.inner.lock().readers += 1;
+        self.raw.lock_shared();
     }
 
     fn try_lock_shared(&self) -> bool {
+        // Non-blocking, so the whole thing fits under the state mutex.
+        let mut inner = self.state.inner.lock();
         if self.raw.try_lock_shared() {
-            self.state.inner.lock().readers += 1;
+            inner.readers += 1;
             true
         } else {
             false
@@ -96,10 +100,19 @@ unsafe impl lock_api::RawRwLock for RawRwLockBell {
             || inner.draining > 0
             || (inner.callbacks.is_empty() && inner.locking == 0)
         {
-            drop(inner);
+            #[cfg(test)]
+            hooks::run(hooks::HookPoint::ReadGuardBeforeSkippedDrainUnlock);
 
+            // Released under the state mutex. Dropping it first would leave a
+            // window where we still hold the lock having already declined to
+            // drain: a `try_write_or` could fail against us and queue with
+            // nobody left to ring it. Neither guard above covers that — the
+            // drain we deferred to can finish inside the window, and the queue
+            // we found empty can be filled inside it.
+            //
             // SAFETY: forwarded from this method's own contract.
             unsafe { self.raw.unlock_shared() };
+            drop(inner);
             return;
         }
 
