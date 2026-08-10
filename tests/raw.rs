@@ -45,6 +45,61 @@ fn test_raw_lock_registers_and_fires_callbacks() {
 }
 
 #[test]
+fn test_raw_try_lock_exclusive_or_queues_on_contention() {
+    let lock = Arc::new(RawLock::new(0u64));
+    let fired = Arc::new(AtomicBool::new(false));
+    let fired2 = fired.clone();
+
+    let held = lock.write();
+
+    // SAFETY: used only to run the bell protocol; the call does not acquire
+    // the lock here because `held` still owns it.
+    let raw = unsafe { lock.raw() };
+    let acquired = raw.try_lock_exclusive_or(move || fired2.store(true, Relaxed));
+    assert!(!acquired, "the lock is held, so the callback is queued");
+
+    assert!(!fired.load(Relaxed));
+    drop(held);
+    assert!(fired.load(Relaxed), "releasing the lock rings the bell");
+}
+
+#[test]
+fn test_raw_try_lock_exclusive_or_success_discards_the_callback() {
+    let lock = RawLock::new(0u64);
+
+    // SAFETY: on success we own the exclusive lock and release it below.
+    let raw = unsafe { lock.raw() };
+    assert!(raw.try_lock_exclusive_or(|| unreachable!()));
+
+    assert!(lock.is_locked_exclusive());
+    // SAFETY: the exclusive lock was acquired just above and never handed out.
+    unsafe { lock.force_unlock_write() };
+    assert!(!lock.is_locked());
+}
+
+/// Both entry points share one queue and one FIFO order.
+#[test]
+fn test_raw_or_and_or_else_interleave_in_registration_order() {
+    let lock = Arc::new(RawLock::new(0u64));
+    let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    let held = lock.write();
+    // SAFETY: used only to run the bell protocol; `held` still owns the lock,
+    // so neither call acquires it.
+    let raw = unsafe { lock.raw() };
+
+    let o1 = order.clone();
+    assert!(!raw.try_lock_exclusive_or(move || o1.lock().unwrap().push(1)));
+    let o2 = order.clone();
+    assert!(!raw.try_lock_exclusive_or_else(|| move || o2.lock().unwrap().push(2)));
+    let o3 = order.clone();
+    assert!(!raw.try_lock_exclusive_or(move || o3.lock().unwrap().push(3)));
+
+    drop(held);
+    assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
+}
+
+#[test]
 fn test_raw_try_lock_exclusive_or_else_success_takes_the_lock() {
     let lock = RawLock::new(0u64);
 

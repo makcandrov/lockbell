@@ -148,7 +148,14 @@ impl<T: ?Sized> RwLockBell<T> {
     where
         Callback: FnOnce() + Send + 'static,
     {
-        self.try_write_or_else(|| callback)
+        if self.raw().try_lock_exclusive_or(callback) {
+            // SAFETY: just acquired above, handed to exactly one guard.
+            Some(RwLockBellWriteGuard(unsafe {
+                self.0.make_write_guard_unchecked()
+            }))
+        } else {
+            None
+        }
     }
 
     /// Like [`try_write_or`], but builds the callback lazily: `factory` runs

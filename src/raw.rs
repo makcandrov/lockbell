@@ -203,16 +203,63 @@ unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
 }
 
 impl<R: RawRwLock> RawRwLockBell<R> {
-    /// Attempts to acquire the exclusive lock; on failure, queues the callback
-    /// produced by `factory`.
+    /// Attempts to acquire the exclusive lock; on failure, queues `callback`.
     ///
     /// The raw counterpart of
-    /// [`RwLockBell::try_write_or_else`](crate::RwLockBell::try_write_or_else),
-    /// and the reason to reach for this type. On `true` the caller owns the
+    /// [`RwLockBell::try_write_or`](crate::RwLockBell::try_write_or). On `true`
+    /// the caller owns the exclusive lock and must release it exactly once, and
+    /// `callback` is discarded.
+    ///
+    /// Not wait-free: it waits out any concurrent flush. Unlike
+    /// [`try_lock_exclusive_or_else`], no user code runs inside that window.
+    ///
+    /// [`try_lock_exclusive_or_else`]: Self::try_lock_exclusive_or_else
+    pub fn try_lock_exclusive_or<Callback>(&self, callback: Callback) -> bool
+    where
+        Callback: FnOnce() + Send + 'static,
+    {
+        // Check and bump under one lock, so the `draining` view can't go stale.
+        let mut inner = self.state.inner.lock();
+
+        while inner.draining > 0 {
+            #[cfg(test)]
+            hooks::run(hooks::HookPoint::TryWriteOrWhileDraining);
+
+            self.state.not_draining.wait(&mut inner);
+        }
+        inner.locking += 1;
+        drop(inner);
+
+        #[cfg(test)]
+        hooks::run(hooks::HookPoint::TryWriteOrBeforeAcquire);
+
+        if self.raw.try_lock_exclusive() {
+            self.state.decrement_locking();
+            true
+        } else {
+            // Boxed only here, so an uncontended call never allocates. Nothing
+            // between the failed acquire and the push can panic, so unlike
+            // `try_lock_exclusive_or_else` there is no `locking` to protect.
+            let cb = Box::new(callback);
+
+            let mut inner = self.state.inner.lock();
+            inner.callbacks.push(cb);
+            inner.decrement_locking(&self.state.locking_zero);
+            false
+        }
+    }
+
+    /// Like [`try_lock_exclusive_or`], but builds the callback lazily:
+    /// `factory` runs only on contention. On `true` the caller owns the
     /// exclusive lock and must release it exactly once.
     ///
-    /// Same rules as there: `factory` must not touch this lock or block, and
-    /// the call is not wait-free — it waits out any concurrent flush.
+    /// The raw counterpart of
+    /// [`RwLockBell::try_write_or_else`](crate::RwLockBell::try_write_or_else).
+    ///
+    /// Same rules as there: `factory` runs inside the window a concurrent
+    /// unlock waits on, so it must not touch this lock and must not block.
+    ///
+    /// [`try_lock_exclusive_or`]: Self::try_lock_exclusive_or
     pub fn try_lock_exclusive_or_else<Callback>(&self, factory: impl FnOnce() -> Callback) -> bool
     where
         Callback: FnOnce() + Send + 'static,
@@ -238,7 +285,7 @@ impl<R: RawRwLock> RawRwLockBell<R> {
         } else {
             // Decrement even if the factory panics, or drainers wait forever.
             let cb = catch_panic(factory, || self.state.decrement_locking());
-            let cb: crate::state::Callback = Box::new(cb);
+            let cb = Box::new(cb);
 
             let mut inner = self.state.inner.lock();
             inner.callbacks.push(cb);
