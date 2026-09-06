@@ -20,10 +20,13 @@ use crate::tests::hooks;
 /// `force_unlock_write` release a lock, so they run queued callbacks — and can
 /// therefore block and panic.
 ///
-/// Worse, `RwLockWriteGuard::unlocked` and its relatives release *before*
-/// installing the guard that re-acquires. A callback panicking there unwinds
-/// past that guard and leaves a live guard holding no lock, which is unsound.
-/// Do not combine them with callbacks that can panic.
+/// Registering callbacks through this raw API is unsafe: users of this lock
+/// must tolerate callbacks unwinding after the underlying lock is released.
+/// In particular, `RwLockReadGuard::unlocked`, `RwLockWriteGuard::unlocked`
+/// and their `Arc` equivalents release *before* installing the guard that
+/// re-acquires. A callback panicking there leaves a live guard holding no lock.
+/// The registration methods' safety contracts forbid that combination on
+/// every thread. [`RwLockBell`](crate::RwLockBell) hides these operations.
 ///
 /// # Requirements on `R`
 ///
@@ -84,7 +87,9 @@ impl<R: RawRwLock> Debug for RawRwLockBell<R> {
 }
 
 // SAFETY: every method forwards its locking obligation to `self.raw`. The bell
-// bookkeeping never grants or releases access to the protected data.
+// bookkeeping never grants or releases access to the protected data. Callback
+// registration is unsafe and requires consumers to tolerate post-release
+// unwinding; RwLockBell enforces this by keeping its lock_api guards private.
 unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
     const INIT: Self = Self {
         raw: <R as RawRwLock>::INIT,
@@ -258,8 +263,28 @@ impl<R: RawRwLock> RawRwLockBell<R> {
     /// survivable, though — the lock is released before the panic propagates,
     /// so it is not stranded.
     ///
+    /// # Safety
+    ///
+    /// The caller must ensure that every consumer of this raw lock that can
+    /// run the queued callback tolerates unwinding after the underlying lock
+    /// is released. In particular, no thread may use `lock_api`'s borrowed or
+    /// `Arc` read/write guard `unlocked` operations on this lock while the
+    /// callback can run: a callback panic would leave their guard unlocked.
+    /// This obligation lasts until the callback has finished running or been
+    /// discarded, including if the raw lock is moved into a `lock_api::RwLock`.
+    /// [`RwLockBell`](crate::RwLockBell) upholds it by hiding those operations.
+    ///
+    /// Registering a callback therefore requires an unsafe call:
+    ///
+    /// ```compile_fail,E0133
+    /// use lockbell::RawRwLockBell;
+    ///
+    /// let raw: RawRwLockBell = RawRwLockBell::default();
+    /// raw.try_lock_exclusive_or(|| {});
+    /// ```
+    ///
     /// [`try_lock_exclusive_or_else`]: Self::try_lock_exclusive_or_else
-    pub fn try_lock_exclusive_or<Callback>(&self, callback: Callback) -> bool
+    pub unsafe fn try_lock_exclusive_or<Callback>(&self, callback: Callback) -> bool
     where
         Callback: FnOnce() + Send + 'static,
     {
@@ -321,9 +346,27 @@ impl<R: RawRwLock> RawRwLockBell<R> {
     /// callback in [`try_lock_exclusive_or`]: it drops with the lock held, so
     /// its captures' destructors must not touch this lock.
     ///
+    /// # Safety
+    ///
+    /// The caller must uphold [`try_lock_exclusive_or`]'s safety contract:
+    /// every consumer that can run the queued callback must tolerate unwinding
+    /// after the underlying unlock. In particular, no thread may use borrowed
+    /// or `Arc` `lock_api` guard `unlocked` operations on this lock while the
+    /// callback can run.
+    ///
+    /// Registering a callback therefore requires an unsafe call:
+    ///
+    /// ```compile_fail,E0133
+    /// use lockbell::RawRwLockBell;
+    ///
+    /// let raw: RawRwLockBell = RawRwLockBell::default();
+    /// raw.try_lock_exclusive_or_else(|| || {});
+    /// ```
+    ///
     /// [`try_lock_exclusive_or`]: Self::try_lock_exclusive_or
-    pub fn try_lock_exclusive_or_else<Callback>(&self, factory: impl FnOnce() -> Callback) -> bool
+    pub unsafe fn try_lock_exclusive_or_else<Callback, Factory>(&self, factory: Factory) -> bool
     where
+        Factory: FnOnce() -> Callback,
         Callback: FnOnce() + Send + 'static,
     {
         // Check and bump under one lock, so the `draining` view can't go stale.

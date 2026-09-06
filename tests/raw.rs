@@ -1,8 +1,10 @@
 //! The escape hatch.
 //!
 //! `RawRwLockBell` lets you drive the bell through `lock_api` directly. That
-//! also reinstates the operations `RwLockBell` deliberately keeps away from it,
-//! so these tests pin what reaching for it costs.
+//! also reinstates the operations `RwLockBell` deliberately keeps away from it.
+//! Callback registration is unsafe because those users must tolerate callback
+//! panics after release; these tests only unlock by consuming their guards or
+//! releasing an acquisition that was never handed to a guard.
 
 use std::sync::{
     Arc,
@@ -36,7 +38,10 @@ fn test_raw_lock_registers_and_fires_callbacks() {
     // SAFETY: used only to run the bell protocol; the call does not acquire
     // the lock here because `held` still owns it.
     let raw = unsafe { lock.raw() };
-    let acquired = raw.try_lock_exclusive_or_else(|| move || fired2.store(true, Relaxed));
+    // SAFETY: the only guard is released by dropping it, never temporarily
+    // unlocked, so unwinding after release cannot invalidate a live guard.
+    let acquired =
+        unsafe { raw.try_lock_exclusive_or_else(|| move || fired2.store(true, Relaxed)) };
     assert!(!acquired, "the lock is held, so the callback is queued");
 
     assert!(!fired.load(Relaxed));
@@ -55,7 +60,9 @@ fn test_raw_try_lock_exclusive_or_queues_on_contention() {
     // SAFETY: used only to run the bell protocol; the call does not acquire
     // the lock here because `held` still owns it.
     let raw = unsafe { lock.raw() };
-    let acquired = raw.try_lock_exclusive_or(move || fired2.store(true, Relaxed));
+    // SAFETY: the only guard is released by dropping it, never temporarily
+    // unlocked, so unwinding after release cannot invalidate a live guard.
+    let acquired = unsafe { raw.try_lock_exclusive_or(move || fired2.store(true, Relaxed)) };
     assert!(!acquired, "the lock is held, so the callback is queued");
 
     assert!(!fired.load(Relaxed));
@@ -69,7 +76,9 @@ fn test_raw_try_lock_exclusive_or_success_discards_the_callback() {
 
     // SAFETY: on success we own the exclusive lock and release it below.
     let raw = unsafe { lock.raw() };
-    assert!(raw.try_lock_exclusive_or(|| unreachable!()));
+    // SAFETY: no live guard is temporarily unlocked; the acquisition is
+    // released exactly once below without creating a guard.
+    assert!(unsafe { raw.try_lock_exclusive_or(|| unreachable!()) });
 
     assert!(lock.is_locked_exclusive());
     // SAFETY: the exclusive lock was acquired just above and never handed out.
@@ -89,11 +98,15 @@ fn test_raw_or_and_or_else_interleave_in_registration_order() {
     let raw = unsafe { lock.raw() };
 
     let o1 = order.clone();
-    assert!(!raw.try_lock_exclusive_or(move || o1.lock().unwrap().push(1)));
     let o2 = order.clone();
-    assert!(!raw.try_lock_exclusive_or_else(|| move || o2.lock().unwrap().push(2)));
     let o3 = order.clone();
-    assert!(!raw.try_lock_exclusive_or(move || o3.lock().unwrap().push(3)));
+    // SAFETY: the only guard is released by dropping it, never temporarily
+    // unlocked, so unwinding after release cannot invalidate a live guard.
+    unsafe {
+        assert!(!raw.try_lock_exclusive_or(move || o1.lock().unwrap().push(1)));
+        assert!(!raw.try_lock_exclusive_or_else(|| move || o2.lock().unwrap().push(2)));
+        assert!(!raw.try_lock_exclusive_or(move || o3.lock().unwrap().push(3)));
+    }
 
     drop(held);
     assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
@@ -105,7 +118,9 @@ fn test_raw_try_lock_exclusive_or_else_success_takes_the_lock() {
 
     // SAFETY: on success we own the exclusive lock and release it below.
     let raw = unsafe { lock.raw() };
-    assert!(raw.try_lock_exclusive_or_else(|| || unreachable!()));
+    // SAFETY: no live guard is temporarily unlocked; the acquisition is
+    // released exactly once below without creating a guard.
+    assert!(unsafe { raw.try_lock_exclusive_or_else(|| || unreachable!()) });
 
     assert!(lock.is_locked_exclusive());
     // SAFETY: the exclusive lock was acquired just above and never handed out.

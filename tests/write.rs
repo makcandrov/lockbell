@@ -116,6 +116,89 @@ fn test_callback_panic_does_not_skip_subsequent() {
     assert!(called.load(Relaxed));
 }
 
+// A zero-sized payload avoids allocating anything in the deliberately leaked
+// secondary payload. Dropping it again would just keep producing more panics.
+struct PanickingPayload;
+
+impl Drop for PanickingPayload {
+    fn drop(&mut self) {
+        panic::panic_any(Self);
+    }
+}
+
+#[test]
+fn regression_payload_drop_panic_preserves_first_panic_and_remaining_callbacks() {
+    struct DroppedPayload(Arc<AtomicBool>);
+    impl Drop for DroppedPayload {
+        fn drop(&mut self) {
+            self.0.store(true, Relaxed);
+        }
+    }
+
+    let lock = RwLockBell::new(0u64);
+    let dropped = Arc::new(AtomicBool::new(false));
+    let called = Arc::new(AtomicBool::new(false));
+    let payload = DroppedPayload(dropped.clone());
+    let called2 = called.clone();
+    let guard = lock.write();
+
+    assert!(
+        lock.try_write_or(|| panic!("first callback panic"))
+            .is_none()
+    );
+    assert!(
+        lock.try_write_or(move || panic::panic_any(payload))
+            .is_none()
+    );
+    assert!(
+        lock.try_write_or(|| panic::panic_any(PanickingPayload))
+            .is_none()
+    );
+    assert!(
+        lock.try_write_or(move || called2.store(true, Relaxed))
+            .is_none()
+    );
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| drop(guard)));
+    let first = result.unwrap_err().downcast::<&'static str>().unwrap();
+    assert_eq!(*first, "first callback panic");
+    assert!(
+        dropped.load(Relaxed),
+        "ordinary suppressed payloads must be dropped"
+    );
+    assert!(
+        called.load(Relaxed),
+        "a payload destructor must not skip callbacks"
+    );
+    assert!(lock.try_write().is_some(), "the lock must remain usable");
+}
+
+#[test]
+fn regression_payload_drop_panic_during_outer_unwind_does_not_abort() {
+    let lock = RwLockBell::new(0u64);
+    let called = Arc::new(AtomicBool::new(false));
+    let called2 = called.clone();
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Exercise the last-reader drain as well as the write drain above.
+        let _guard = lock.read();
+        assert!(
+            lock.try_write_or(|| panic::panic_any(PanickingPayload))
+                .is_none()
+        );
+        assert!(
+            lock.try_write_or(move || called2.store(true, Relaxed))
+                .is_none()
+        );
+        panic!("outer user panic");
+    }));
+
+    let outer = result.unwrap_err().downcast::<&'static str>().unwrap();
+    assert_eq!(*outer, "outer user panic");
+    assert!(called.load(Relaxed));
+    assert!(lock.try_write().is_some(), "the lock must remain usable");
+}
+
 #[test]
 fn test_write_guard_mutates_value() {
     let lock = RwLockBell::new(0u64);

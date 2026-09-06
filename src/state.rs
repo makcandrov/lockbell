@@ -112,20 +112,38 @@ pub(crate) fn drain_and_run(state: &LockState, callbacks: Vec<Callback>) {
     #[cfg(test)]
     hooks::run(hooks::HookPoint::DrainBeforeCallbacks);
 
-    // `.or(result)`, not `.or_else`: every callback must still run after one
-    // has panicked.
-    let first_panic = callbacks.into_iter().fold(None, |first, callback| {
-        let result = panic::catch_unwind(AssertUnwindSafe(callback)).err();
-        first.or(result)
-    });
+    let mut first_panic = None;
+    for callback in callbacks {
+        if let Err(payload) = panic::catch_unwind(AssertUnwindSafe(callback)) {
+            if first_panic.is_none() {
+                first_panic = Some(payload);
+            } else {
+                // Dropping a panic payload is user code too. It must not
+                // interrupt the rest of this batch or replace the first panic.
+                discard_panic(payload);
+            }
+        }
+    }
 
     if let Some(payload) = first_panic {
         // Re-raising mid-unwind would abort; the outer panic is the primary one.
         if std::thread::panicking() {
-            drop(payload);
+            discard_panic(payload);
         } else {
             panic::resume_unwind(payload);
         }
+    }
+}
+
+/// Disposes of a suppressed panic without letting its destructor unwind.
+/// Only used after a callback panics; normal callbacks pay no extra catch.
+#[cold]
+fn discard_panic(payload: Box<dyn std::any::Any + Send>) {
+    // A destructor can panic with another payload whose destructor also
+    // panics. Forget that secondary payload instead of recursively dropping
+    // it: retrying could recurse forever or abort during an outer unwind.
+    if let Err(secondary) = panic::catch_unwind(AssertUnwindSafe(|| drop(payload))) {
+        forget(secondary);
     }
 }
 

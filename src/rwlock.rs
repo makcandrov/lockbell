@@ -163,7 +163,9 @@ impl<T: ?Sized> RwLockBell<T> {
     where
         Callback: FnOnce() + Send + 'static,
     {
-        if self.raw().try_lock_exclusive_or(callback) {
+        // SAFETY: the raw lock and lock_api guards stay private. Our guards
+        // never temporarily unlock, so a callback may unwind after release.
+        if unsafe { self.raw().try_lock_exclusive_or(callback) } {
             // SAFETY: just acquired above, handed to exactly one guard.
             Some(RwLockBellWriteGuard(unsafe {
                 self.0.make_write_guard_unchecked()
@@ -233,7 +235,9 @@ impl<T: ?Sized> RwLockBell<T> {
         Factory: FnOnce() -> Callback,
         Callback: FnOnce() + Send + 'static,
     {
-        if self.raw().try_lock_exclusive_or_else(factory) {
+        // SAFETY: the raw lock and lock_api guards stay private. Our guards
+        // never temporarily unlock, so a callback may unwind after release.
+        if unsafe { self.raw().try_lock_exclusive_or_else(factory) } {
             // SAFETY: just acquired above, handed to exactly one guard.
             Some(RwLockBellWriteGuard(unsafe {
                 self.0.make_write_guard_unchecked()
@@ -314,7 +318,9 @@ impl<T: ?Sized> RwLockBell<T> {
         Factory: FnOnce() -> Callback,
         Callback: FnOnce() + Send + 'static,
     {
-        if self.raw().try_lock_exclusive_or_else(factory) {
+        // SAFETY: the raw lock and lock_api guards stay private, including
+        // Arc guards. No exposed operation temporarily unlocks a live guard.
+        if unsafe { self.raw().try_lock_exclusive_or_else(factory) } {
             // SAFETY: just acquired above, handed to exactly one guard.
             Some(ArcRwLockBellWriteGuard(unsafe {
                 self.as_raw_arc().make_arc_write_guard_unchecked()
