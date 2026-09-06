@@ -29,11 +29,11 @@ let guard = lock.write();
 // Fails: lock is held. Callback is queued.
 lock.try_write_or(|| println!("lock is free now"));
 
-// Dropping the guard fires all queued callbacks in FIFO order.
+// Dropping the guard fires all queued callbacks.
 drop(guard);
 ```
 
-When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushed in FIFO order — without holding any lock — when either:
+When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushed — without holding any lock — when either:
 
 - a write guard is dropped, or
 - the last active read guard is dropped (if callbacks were queued while readers held the lock).
@@ -45,8 +45,10 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
 
 ## Callback semantics
 
-- Callbacks run **after** the guard they lost to is released, in registration order. A callback is never rung while the very guard that turned it away is still holding the lock.
-- A callback is a notification, not a lock acquisition — the lock may already be re-acquired by the time the callback fires.
+- Callbacks run **after** the release that drains them — never from inside it, and never with the firing thread holding a lock.
+- A release snapshots the queue while it still holds, then fires that batch in registration order once it has let go. Ordering is **per batch**, not global: a callback that re-acquires the lock drains whatever it queues before returning, so a later registration can run ahead of an earlier one still waiting its turn in the outer batch.
+- A callback is a notification, not a lock acquisition — by the time it fires the lock may already be held again, including by a reader that joined mid-release and was itself one of the guards the call lost to.
+- A reader registers with the bell *before* it acquires, so a reader still waiting on the lock already counts as active. The departing last holder therefore defers the flush to it, and a queued callback waits out that reader's whole hold rather than firing the moment the lock next goes free.
 - Callbacks must be `FnOnce() + Send + 'static`.
 - A panicking callback does not prevent subsequent callbacks from running.
 - `try_write_or` is not wait-free despite the name: it waits out a concurrent
@@ -57,7 +59,11 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
   not block. The callback it returns has no such restriction, so expensive
   construction belongs there rather than in the factory. `try_write_or` takes
   an already-built callback and so runs no code of yours in that window at all.
-- Formatting a lock with `{:?}` never rings the bell.
+- Formatting a lock with `{:?}` **is** a lock acquisition: it takes a real read
+  lock, counts as a reader, and rings the bell if it turns out to be the last
+  reader out with callbacks queued. It can therefore run a callback, block on a
+  concurrent factory, and panic with a callback's payload. Do not format a
+  lock from a place that cannot take those.
 
 ## Installation
 

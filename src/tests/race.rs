@@ -771,3 +771,130 @@ fn regression_skipped_read_drain_releases_under_the_mutex() {
         "T saw a free lock, so it must have taken it outright"
     );
 }
+
+// ─── regression: a writer that skips the drain must not open a window ────────
+
+/// The write-side mirror of [`regression_skipped_read_drain_releases_under_the_mutex`].
+///
+/// `unlock_exclusive` used to close the gate on every release, batch or no
+/// batch, so a `try_write_or` racing an uncontended write release waited it
+/// out. It now skips the drain when the queue is empty and nothing is in
+/// flight — which means it must release the raw lock under the state mutex,
+/// for exactly the reason the read path does. Dropping the mutex first would
+/// leave a window where it still holds the lock having already declined to
+/// drain, and a `try_write_or` landing there would queue into nothing.
+///
+/// W parks mid-release with the drain declined, and T must not get past the
+/// bell bookkeeping until W is fully out.
+#[test]
+fn regression_skipped_write_drain_releases_under_the_mutex() {
+    let _g = TestGuard::acquire();
+    let lock = Arc::new(RwLockBell::new(0u64));
+    let fired = Arc::new(AtomicBool::new(false));
+    let t_decided = Arc::new(AtomicBool::new(false));
+    let t_queued = Arc::new(AtomicBool::new(false));
+
+    // Queue empty, locking == 0 and no drain in flight, so dropping `w` takes
+    // the non-draining branch.
+    let w = lock.write();
+
+    let w_parked = Gate::new();
+    let w_release = Gate::new();
+    let wp2 = w_parked.clone();
+    let wr2 = w_release.clone();
+    hooks::set(HookPoint::WriteGuardBeforeSkippedDrainUnlock, move || {
+        hooks::clear(HookPoint::WriteGuardBeforeSkippedDrainUnlock); // one-shot
+        wp2.signal();
+        wr2.wait();
+    });
+
+    let lock_t = lock.clone();
+    let fired_t = fired.clone();
+    let td2 = t_decided.clone();
+    let tq2 = t_queued.clone();
+    let orchestrator = thread::spawn(move || {
+        w_parked.wait_for_arrival(); // W declined the drain, still holds
+
+        let t_handle = thread::spawn(move || {
+            let got = lock_t.try_write_or(move || fired_t.store(true, Relaxed));
+            tq2.store(got.is_none(), Relaxed);
+            td2.store(true, Relaxed);
+            drop(got);
+        });
+
+        // T must still be blocked on the state mutex. Sampled before releasing
+        // W, so a failure reports rather than deadlocks.
+        thread::sleep(Duration::from_millis(100));
+        let decided_early = t_decided.load(Relaxed);
+
+        w_release.open();
+        t_handle.join().unwrap();
+        decided_early
+    });
+
+    let watchdog_stop = Arc::new(AtomicBool::new(false));
+    let watchdog_stop2 = watchdog_stop.clone();
+    let watchdog = thread::spawn(move || {
+        for _ in 0..100 {
+            if watchdog_stop2.load(Relaxed) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        eprintln!("[regression_skipped_write_drain_releases_under_the_mutex] WATCHDOG fired");
+        std::process::abort();
+    });
+
+    drop(w); // parks in the hook
+
+    let decided_early = orchestrator.join().unwrap();
+    watchdog_stop.store(true, Relaxed);
+    watchdog.join().unwrap();
+
+    assert!(
+        !decided_early,
+        "a try_write_or resolved while a writer was mid-release having declined to drain"
+    );
+    assert!(!lock.is_locked(), "every guard is gone");
+    assert!(
+        !t_queued.load(Relaxed) || fired.load(Relaxed),
+        "a queued callback was stranded"
+    );
+    assert!(
+        !t_queued.load(Relaxed),
+        "T saw a free lock, so it must have taken it outright"
+    );
+}
+
+/// The skipped write drain must not leave the gate shut: a `try_write_or`
+/// arriving right after an uncontended write release resolves immediately
+/// rather than waiting out a drain that had nothing to ring.
+#[test]
+fn test_uncontended_write_release_does_not_close_the_gate() {
+    let _g = TestGuard::acquire();
+    let lock = RwLockBell::new(0u64);
+
+    let entered_drain = Arc::new(AtomicBool::new(false));
+    let ed2 = entered_drain.clone();
+    hooks::set(HookPoint::WriteGuardAfterEnteringDrain, move || {
+        ed2.store(true, Relaxed);
+    });
+
+    drop(lock.write());
+    assert!(
+        !entered_drain.load(Relaxed),
+        "an empty write release must not bump `draining`"
+    );
+
+    // With a callback queued it must still drain.
+    let fired = Arc::new(AtomicBool::new(false));
+    let f2 = fired.clone();
+    let held = lock.write();
+    assert!(lock.try_write_or(move || f2.store(true, Relaxed)).is_none());
+    drop(held);
+    assert!(
+        entered_drain.load(Relaxed),
+        "a non-empty release must drain"
+    );
+    assert!(fired.load(Relaxed), "and must ring");
+}

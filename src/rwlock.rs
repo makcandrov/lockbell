@@ -19,13 +19,15 @@ type RawLock<T> = lock_api::RwLock<RawRwLockBell, T>;
 /// contention clears.
 ///
 /// When [`try_write_or`] cannot acquire the lock, the supplied callback is
-/// queued. All queued callbacks fire in FIFO order, without the firing thread
-/// holding any lock, when the next write guard (or last reader) is dropped.
+/// queued. All queued callbacks fire, without the firing thread holding any
+/// lock, when the next write guard (or last reader) is dropped.
 ///
 /// Both release paths snapshot the queue while still holding the lock, so a
 /// batch only contains callbacks that lost their race to the guard now
-/// releasing; none is rung while the holder that turned it away still holds. A
-/// *different* thread may have taken the lock by then.
+/// releasing, and none of them is rung until that guard has let go. The lock
+/// itself may well be held again by then — by another thread, or by a reader
+/// that joined during the release and was itself one of the guards those
+/// callbacks lost to.
 ///
 /// Dropping the lock, or calling [`into_inner`], discards whatever is still
 /// queued without calling it.
@@ -138,13 +140,22 @@ impl<T: ?Sized> RwLockBell<T> {
     ///   firing thread holding no lock, after the next write guard (or last
     ///   reader) is dropped.
     ///
-    /// Callbacks fire in FIFO registration order, sharing one queue with
-    /// [`try_write_or_else`]. A panicking callback does not prevent the rest of
-    /// the queue from running; see there for the blocking and callback-panic
-    /// rules, which apply here too.
+    /// Callbacks share one queue with [`try_write_or_else`] and fire in
+    /// registration order within a batch — a callback that re-acquires the lock
+    /// drains whatever it queues before returning, so ordering does not carry
+    /// across batches. A panicking callback does not prevent the rest of the
+    /// queue from running; see there for the blocking and callback-panic rules,
+    /// which apply here too.
     ///
     /// Its deadlock rule does not: `callback` is already built, so none of your
     /// code runs inside the window a concurrent unlock waits on.
+    ///
+    /// # Discarding the callback
+    ///
+    /// On success `callback` is dropped **while the lock is held**, before the
+    /// guard exists. Its captures' destructors therefore must not touch this
+    /// lock — that deadlocks. A panicking destructor is safe: the lock is
+    /// released before the panic reaches you.
     ///
     /// [`try_write_or_else`]: Self::try_write_or_else
     #[inline]
@@ -202,6 +213,11 @@ impl<T: ?Sized> RwLockBell<T> {
     ///
     /// A panicking `factory` propagates to the caller; no callback is queued and
     /// the bookkeeping stays consistent.
+    ///
+    /// On success the unused `factory` is dropped with the lock held, under the
+    /// same rule as [`try_write_or`]'s callback: a panicking destructor
+    /// propagates but does not strand the lock, and a destructor that touches
+    /// this lock deadlocks.
     ///
     /// A panicking *callback* does not stop the rest of the batch. The first
     /// panic is re-raised from the draining thread afterwards, unless that
@@ -331,23 +347,39 @@ impl<T: ?Sized> RwLockBell<T> {
 
 /// Formats the protected value if it can be read, `<locked>` otherwise.
 ///
-/// Never rings the bell: the shared lock it takes bypasses the callback
-/// machinery, so `{:?}` cannot run a callback, block or panic. In exchange, a
-/// `try_write_or` losing to this transient lock waits for the next real
-/// release rather than being drained here.
+/// # This rings the bell
+///
+/// The shared lock is a real one — [`try_read`], the same call
+/// [`parking_lot::RwLock`] formats through — so it counts as a reader and its
+/// release drains like any other. Formatting therefore **can run a callback,
+/// block, and panic**, and is subject to every rule a read guard is:
+///
+/// - It runs callbacks only when this format is the last live reader *and*
+///   something is queued. An uncontended `{:?}` touches nothing.
+/// - It waits out a concurrent [`try_write_or_else`] factory, so a slow factory
+///   makes `{:?}` slow.
+/// - A panicking callback propagates out of `fmt`.
+///
+/// The alternative — a shared lock the bell cannot see — is worse: a
+/// `try_write_or` losing to a transient `{:?}` would queue a callback that the
+/// format could not ring and no later release was obliged to, stranding it for
+/// good if the lock then went idle.
+///
+/// So treat `{:?}` on this type as a lock acquisition, not a free observation:
+/// don't format one while holding a lock a callback might want.
+///
+/// [`try_read`]: Self::try_read
+/// [`try_write_or_else`]: Self::try_write_or_else
 impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLockBell<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut out = f.debug_struct("RwLockBell");
-        match self.raw().peek() {
-            Some(_peek) => {
-                // SAFETY: `_peek` holds a shared lock for the whole borrow.
-                let data = unsafe { &*self.0.data_ptr() };
-                out.field("data", &data)
-            }
+        // The guard outlives `finish`, so the drain — and any callback it rings
+        // — lands after formatting is done rather than part-way through it.
+        match self.try_read() {
+            Some(guard) => out.field("data", &&*guard).finish(),
             // `format_args!` avoids quoting `<locked>`.
-            None => out.field("data", &format_args!("<locked>")),
+            None => out.field("data", &format_args!("<locked>")).finish(),
         }
-        .finish()
     }
 }
 

@@ -280,3 +280,78 @@ fn callback_panic_still_propagates_when_no_outer_panic() {
         "callback panic must still propagate in normal flow"
     );
 }
+
+/// A panicking destructor on the *discarded* callback used to strand the lock:
+/// it dropped with the lock held and no guard yet built to release it.
+#[test]
+fn regression_discarded_callback_drop_panic_does_not_strand_the_lock() {
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("destructor boom");
+        }
+    }
+
+    let lock = RwLockBell::new(0u64);
+
+    let p = PanicOnDrop;
+    let r = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = lock.try_write_or(move || {
+            let _ = &p;
+        });
+    }));
+    assert!(r.is_err(), "the destructor panic must propagate");
+    assert!(
+        lock.try_write().is_some(),
+        "lock stranded: no guard existed to release it"
+    );
+
+    let p = PanicOnDrop;
+    let r = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = lock.try_write_or_else(move || {
+            let _ = &p;
+            || {}
+        });
+    }));
+    assert!(r.is_err());
+    assert!(
+        lock.try_write().is_some(),
+        "lock stranded by the factory drop"
+    );
+}
+
+/// The release on that path is the real one, not a bare raw unlock: the bell
+/// bookkeeping survives, so the lock keeps ringing afterwards.
+#[test]
+fn regression_discarded_callback_drop_panic_leaves_the_bell_working() {
+    struct PanicOnDrop;
+    impl Drop for PanicOnDrop {
+        fn drop(&mut self) {
+            panic!("destructor boom");
+        }
+    }
+
+    let lock = RwLockBell::new(0u64);
+
+    let p = PanicOnDrop;
+    let r = panic::catch_unwind(AssertUnwindSafe(|| {
+        let _ = lock.try_write_or(move || {
+            let _ = &p;
+        });
+    }));
+    assert!(r.is_err());
+
+    // A full cycle must still work: acquire, queue, drain, ring.
+    let fired = Arc::new(AtomicBool::new(false));
+    let f = fired.clone();
+    let held = lock.write();
+    assert!(
+        lock.try_write_or(move || f.store(true, Relaxed)).is_none(),
+        "the lock is held, so this must queue"
+    );
+    drop(held);
+    assert!(
+        fired.load(Relaxed),
+        "bell wedged after the destructor panic"
+    );
+}

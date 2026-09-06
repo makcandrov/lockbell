@@ -16,9 +16,14 @@ use crate::tests::hooks;
 /// # Using it directly
 ///
 /// Prefer [`RwLockBell`](crate::RwLockBell). In a bare
-/// `lock_api::RwLock<RawRwLockBell, T>`, the `Debug` impl and
-/// `force_unlock_read` / `force_unlock_write` all release a lock, so they run
-/// queued callbacks — and can therefore block and panic.
+/// `lock_api::RwLock<RawRwLockBell, T>`, `force_unlock_read` /
+/// `force_unlock_write` release a lock, so they run queued callbacks — and can
+/// therefore block and panic.
+///
+/// Worse, `RwLockWriteGuard::unlocked` and its relatives release *before*
+/// installing the guard that re-acquires. A callback panicking there unwinds
+/// past that guard and leaves a live guard holding no lock, which is unsound.
+/// Do not combine them with callbacks that can panic.
 ///
 /// # Requirements on `R`
 ///
@@ -28,13 +33,18 @@ use crate::tests::hooks;
 ///   bookkeeping already committed, so a panic strands `readers`, `locking` or
 ///   `draining` above zero and wedges the bell permanently: callbacks queue and
 ///   never ring, or every later drain blocks forever.
-/// - **[`try_lock_shared`] and [`unlock_shared`] must not block or re-enter
-///   this lock.** Both are called with the bell's own mutex held.
+/// - **[`try_lock_shared`], [`unlock_shared`] and [`unlock_exclusive`] must not
+///   block or re-enter this lock.** All three are called with the bell's own
+///   mutex held — `unlock_exclusive` on the branch that skips the drain.
+/// - **[`try_lock_exclusive`] must not block either.** It runs between bumping
+///   `locking` and resolving it, and a concurrent release sits in that window
+///   waiting for `locking` to reach zero while still holding the lock. Blocking
+///   there stalls every drain and every other `try_write_or`.
 /// - **[`GuardMarker`] is `R`'s.** A `GuardSend` lock yields `Send` guards, so
 ///   the release — and with it the whole callback batch — can run on a thread
 ///   that never acquired.
 ///
-/// [`parking_lot::RawRwLock`] satisfies all three.
+/// [`parking_lot::RawRwLock`] satisfies all four.
 ///
 /// # Extending it
 ///
@@ -51,6 +61,8 @@ use crate::tests::hooks;
 /// [`lock_shared`]: parking_lot::lock_api::RawRwLock::lock_shared
 /// [`try_lock_shared`]: parking_lot::lock_api::RawRwLock::try_lock_shared
 /// [`unlock_shared`]: parking_lot::lock_api::RawRwLock::unlock_shared
+/// [`try_lock_exclusive`]: parking_lot::lock_api::RawRwLock::try_lock_exclusive
+/// [`unlock_exclusive`]: parking_lot::lock_api::RawRwLock::unlock_exclusive
 pub struct RawRwLockBell<R = parking_lot::RawRwLock> {
     raw: R,
     state: LockState,
@@ -169,19 +181,44 @@ unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
         #[cfg(test)]
         hooks::run(hooks::HookPoint::WriteGuardBeforeDrop);
 
-        let callbacks = {
-            let mut inner = self.state.inner.lock();
-            inner.draining += 1;
+        let mut inner = self.state.inner.lock();
 
+        // Nothing queued and nothing in flight: there is no batch to take, so
+        // skip the drain and leave the gate open. Closing it here made every
+        // concurrent `try_write_or` wait out a release that had nothing to
+        // ring — the common case on a write-heavy lock.
+        //
+        // `draining > 0` deliberately still drains. It already implies an
+        // empty queue and `locking == 0` — the gate is shut, so nothing can
+        // have been pushed since — but keeping the bump preserves the rule
+        // that a release overlapping a drain's tail holds the gate shut until
+        // it is itself out.
+        if inner.draining == 0 && inner.callbacks.is_empty() && inner.locking == 0 {
             #[cfg(test)]
-            hooks::run(hooks::HookPoint::WriteGuardAfterEnteringDrain);
+            hooks::run(hooks::HookPoint::WriteGuardBeforeSkippedDrainUnlock);
 
-            // Wait out every in-flight `try_write_or`.
-            while inner.locking != 0 {
-                self.state.locking_zero.wait(&mut inner);
-            }
-            take(&mut inner.callbacks)
-        };
+            // Released under the state mutex, exactly as in `unlock_shared`.
+            // Dropping it first would leave a window where we still hold the
+            // lock having already declined to drain: a `try_write_or` could
+            // fail against us and queue with nobody left to ring it.
+            //
+            // SAFETY: forwarded from this method's own contract.
+            unsafe { self.raw.unlock_exclusive() };
+            drop(inner);
+            return;
+        }
+
+        inner.draining += 1;
+
+        #[cfg(test)]
+        hooks::run(hooks::HookPoint::WriteGuardAfterEnteringDrain);
+
+        // Wait out every in-flight `try_write_or`.
+        while inner.locking != 0 {
+            self.state.locking_zero.wait(&mut inner);
+        }
+        let callbacks = take(&mut inner.callbacks);
+        drop(inner);
 
         #[cfg(test)]
         hooks::run(hooks::HookPoint::WriteGuardBeforeRawUnlock);
@@ -213,6 +250,14 @@ impl<R: RawRwLock> RawRwLockBell<R> {
     /// Not wait-free: it waits out any concurrent flush. Unlike
     /// [`try_lock_exclusive_or_else`], no user code runs inside that window.
     ///
+    /// # Discarding the callback
+    ///
+    /// On `true`, `callback` is dropped here — **with the lock held**, before
+    /// the caller can build a guard. So its captures' destructors must not
+    /// touch this lock: doing so deadlocks. A destructor that panics is
+    /// survivable, though — the lock is released before the panic propagates,
+    /// so it is not stranded.
+    ///
     /// [`try_lock_exclusive_or_else`]: Self::try_lock_exclusive_or_else
     pub fn try_lock_exclusive_or<Callback>(&self, callback: Callback) -> bool
     where
@@ -235,6 +280,19 @@ impl<R: RawRwLock> RawRwLockBell<R> {
 
         if self.raw.try_lock_exclusive() {
             self.state.decrement_locking();
+
+            // The discarded `callback` drops here, holding the lock with no
+            // guard yet built to release it: a panicking destructor would
+            // strand it for good. Release on the way out, exactly as the guard
+            // the caller is about to build would have.
+            //
+            // SAFETY: acquired just above and not yet handed to a guard, so we
+            // own the release. Scoped to this branch: on the other one we hold
+            // nothing, and releasing there would unlock a lock we never took.
+            catch_panic(
+                move || drop(callback),
+                || unsafe { <Self as RawRwLock>::unlock_exclusive(self) },
+            );
             true
         } else {
             // Boxed only here, so an uncontended call never allocates. Nothing
@@ -259,6 +317,10 @@ impl<R: RawRwLock> RawRwLockBell<R> {
     /// Same rules as there: `factory` runs inside the window a concurrent
     /// unlock waits on, so it must not touch this lock and must not block.
     ///
+    /// On `true` the unused `factory` is discarded under the same rule as the
+    /// callback in [`try_lock_exclusive_or`]: it drops with the lock held, so
+    /// its captures' destructors must not touch this lock.
+    ///
     /// [`try_lock_exclusive_or`]: Self::try_lock_exclusive_or
     pub fn try_lock_exclusive_or_else<Callback>(&self, factory: impl FnOnce() -> Callback) -> bool
     where
@@ -281,6 +343,15 @@ impl<R: RawRwLock> RawRwLockBell<R> {
 
         if self.raw.try_lock_exclusive() {
             self.state.decrement_locking();
+
+            // The unused `factory` drops here under the same rule as the
+            // callback in `try_lock_exclusive_or`.
+            //
+            // SAFETY: acquired just above and not yet handed to a guard.
+            catch_panic(
+                move || drop(factory),
+                || unsafe { <Self as RawRwLock>::unlock_exclusive(self) },
+            );
             true
         } else {
             // Decrement even if the factory panics, or drainers wait forever.
@@ -292,21 +363,5 @@ impl<R: RawRwLock> RawRwLockBell<R> {
             inner.decrement_locking(&self.state.locking_zero);
             false
         }
-    }
-
-    /// Takes a shared lock without touching the bell: no reader accounting, no
-    /// drain on release. Lets `Debug` format a lock without ringing it.
-    pub(crate) fn peek(&self) -> Option<Peek<'_, R>> {
-        self.raw.try_lock_shared().then(|| Peek(&self.raw))
-    }
-}
-
-/// Holds a bell-free shared lock for as long as it lives.
-pub(crate) struct Peek<'a, R: RawRwLock>(&'a R);
-
-impl<R: RawRwLock> Drop for Peek<'_, R> {
-    fn drop(&mut self) {
-        // SAFETY: only constructed after a successful `try_lock_shared`.
-        unsafe { self.0.unlock_shared() };
     }
 }

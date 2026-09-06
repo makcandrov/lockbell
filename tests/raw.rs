@@ -115,9 +115,8 @@ fn test_raw_try_lock_exclusive_or_else_success_takes_the_lock() {
 
 #[test]
 fn test_raw_lock_debug_goes_through_the_bell() {
-    // Documented consequence of the escape hatch: lock_api's `Debug` probes
-    // with `try_read()`, which runs the full release path. `RwLockBell` uses a
-    // bell-free peek instead.
+    // lock_api's `Debug` probes with `try_read()`, which runs the full release
+    // path. `RwLockBell::fmt` does the same, deliberately.
     let lock = RawLock::new(42u64);
     assert_eq!(format!("{lock:?}"), "RwLock { data: 42 }");
 }

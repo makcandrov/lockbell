@@ -60,6 +60,12 @@ pub enum HookPoint {
     /// `unlock_shared`: non-draining branch, shared lock still held and the
     /// state mutex still taken. Anything reaching for the bell blocks here.
     ReadGuardBeforeSkippedDrainUnlock,
+
+    /// `unlock_exclusive`: same, with the exclusive lock still held. The
+    /// write-side mirror of [`ReadGuardBeforeSkippedDrainUnlock`].
+    ///
+    /// [`ReadGuardBeforeSkippedDrainUnlock`]: Self::ReadGuardBeforeSkippedDrainUnlock
+    WriteGuardBeforeSkippedDrainUnlock,
 }
 
 type HookFn = Arc<dyn Fn() + Send + Sync + 'static>;
