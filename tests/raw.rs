@@ -4,9 +4,12 @@
 //! also reinstates the operations `RwLockBell` deliberately keeps away from it,
 //! so these tests pin what reaching for it costs.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering::Relaxed},
+use std::{
+    panic::{self, AssertUnwindSafe},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering::Relaxed},
+    },
 };
 
 use lockbell::RawRwLockBell;
@@ -37,7 +40,10 @@ fn test_raw_lock_registers_and_fires_callbacks() {
     // the lock here because `held` still owns it.
     let raw = unsafe { lock.raw() };
     let acquired = raw.try_lock_exclusive_or_else(|| move || fired2.store(true, Relaxed));
-    assert!(!acquired, "the lock is held, so the callback is queued");
+    assert!(
+        acquired.is_none(),
+        "the lock is held, so the callback is queued"
+    );
 
     assert!(!fired.load(Relaxed));
     drop(held);
@@ -56,7 +62,10 @@ fn test_raw_try_lock_exclusive_or_queues_on_contention() {
     // the lock here because `held` still owns it.
     let raw = unsafe { lock.raw() };
     let acquired = raw.try_lock_exclusive_or(move || fired2.store(true, Relaxed));
-    assert!(!acquired, "the lock is held, so the callback is queued");
+    assert!(
+        acquired.is_none(),
+        "the lock is held, so the callback is queued"
+    );
 
     assert!(!fired.load(Relaxed));
     drop(held);
@@ -69,11 +78,13 @@ fn test_raw_try_lock_exclusive_or_success_discards_the_callback() {
 
     // SAFETY: on success we own the exclusive lock and release it below.
     let raw = unsafe { lock.raw() };
-    assert!(raw.try_lock_exclusive_or(|| unreachable!()));
+    let guard = raw
+        .try_lock_exclusive_or(|| unreachable!())
+        .expect("the lock is free, so it is acquired");
 
     assert!(lock.is_locked_exclusive());
     // SAFETY: the exclusive lock was acquired just above and never handed out.
-    unsafe { lock.force_unlock_write() };
+    unsafe { lock.force_unlock_write(guard) };
     assert!(!lock.is_locked());
 }
 
@@ -89,11 +100,20 @@ fn test_raw_or_and_or_else_interleave_in_registration_order() {
     let raw = unsafe { lock.raw() };
 
     let o1 = order.clone();
-    assert!(!raw.try_lock_exclusive_or(move || o1.lock().unwrap().push(1)));
+    assert!(
+        raw.try_lock_exclusive_or(move || o1.lock().unwrap().push(1))
+            .is_none()
+    );
     let o2 = order.clone();
-    assert!(!raw.try_lock_exclusive_or_else(|| move || o2.lock().unwrap().push(2)));
+    assert!(
+        raw.try_lock_exclusive_or_else(|| move || o2.lock().unwrap().push(2))
+            .is_none()
+    );
     let o3 = order.clone();
-    assert!(!raw.try_lock_exclusive_or(move || o3.lock().unwrap().push(3)));
+    assert!(
+        raw.try_lock_exclusive_or(move || o3.lock().unwrap().push(3))
+            .is_none()
+    );
 
     drop(held);
     assert_eq!(*order.lock().unwrap(), vec![1, 2, 3]);
@@ -105,12 +125,37 @@ fn test_raw_try_lock_exclusive_or_else_success_takes_the_lock() {
 
     // SAFETY: on success we own the exclusive lock and release it below.
     let raw = unsafe { lock.raw() };
-    assert!(raw.try_lock_exclusive_or_else(|| || unreachable!()));
+    let guard = raw
+        .try_lock_exclusive_or_else(|| || unreachable!())
+        .expect("the lock is free, so it is acquired");
 
     assert!(lock.is_locked_exclusive());
     // SAFETY: the exclusive lock was acquired just above and never handed out.
-    unsafe { lock.force_unlock_write() };
+    unsafe { lock.force_unlock_write(guard) };
     assert!(!lock.is_locked());
+}
+
+/// Registration is safe because `lock_api` re-acquires before a panicking
+/// release unwinds out of `unlocked`, so the guard never outlives its lock.
+#[test]
+fn test_raw_callback_panic_inside_unlocked_leaves_guard_locked() {
+    let lock = RawLock::new(0u64);
+    let mut w = lock.write();
+
+    // SAFETY: used only to run the bell protocol; `w` still owns the lock.
+    let raw = unsafe { lock.raw() };
+    assert!(raw.try_lock_exclusive_or(|| panic!("callback")).is_none());
+
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        lock_api::RwLockWriteGuard::unlocked(&mut w, || ())
+    }));
+    assert!(result.is_err(), "the callback panic propagates");
+
+    assert!(lock.is_locked_exclusive(), "the guard holds the lock again");
+    *w = 1;
+    drop(w);
+    assert!(!lock.is_locked());
+    assert_eq!(*lock.read(), 1);
 }
 
 #[test]

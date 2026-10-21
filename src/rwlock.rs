@@ -163,14 +163,12 @@ impl<T: ?Sized> RwLockBell<T> {
     where
         Callback: FnOnce() + Send + 'static,
     {
-        if self.raw().try_lock_exclusive_or(callback) {
-            // SAFETY: just acquired above, handed to exactly one guard.
-            Some(RwLockBellWriteGuard(unsafe {
-                self.0.make_write_guard_unchecked()
-            }))
-        } else {
-            None
-        }
+        let guard = self.raw().try_lock_exclusive_or(callback)?;
+        // SAFETY: the state of the acquisition just made above, handed to
+        // exactly one guard.
+        Some(RwLockBellWriteGuard(unsafe {
+            self.0.make_write_guard_unchecked(guard)
+        }))
     }
 
     /// Like [`try_write_or`], but builds the callback lazily: `factory` runs
@@ -233,14 +231,12 @@ impl<T: ?Sized> RwLockBell<T> {
         Factory: FnOnce() -> Callback,
         Callback: FnOnce() + Send + 'static,
     {
-        if self.raw().try_lock_exclusive_or_else(factory) {
-            // SAFETY: just acquired above, handed to exactly one guard.
-            Some(RwLockBellWriteGuard(unsafe {
-                self.0.make_write_guard_unchecked()
-            }))
-        } else {
-            None
-        }
+        let guard = self.raw().try_lock_exclusive_or_else(factory)?;
+        // SAFETY: the state of the acquisition just made above, handed to
+        // exactly one guard.
+        Some(RwLockBellWriteGuard(unsafe {
+            self.0.make_write_guard_unchecked(guard)
+        }))
     }
 }
 
@@ -314,14 +310,12 @@ impl<T: ?Sized> RwLockBell<T> {
         Factory: FnOnce() -> Callback,
         Callback: FnOnce() + Send + 'static,
     {
-        if self.raw().try_lock_exclusive_or_else(factory) {
-            // SAFETY: just acquired above, handed to exactly one guard.
-            Some(ArcRwLockBellWriteGuard(unsafe {
-                self.as_raw_arc().make_arc_write_guard_unchecked()
-            }))
-        } else {
-            None
-        }
+        let guard = self.raw().try_lock_exclusive_or_else(factory)?;
+        // SAFETY: the state of the acquisition just made above, handed to
+        // exactly one guard.
+        Some(ArcRwLockBellWriteGuard(unsafe {
+            self.as_raw_arc().make_arc_write_guard_unchecked(guard)
+        }))
     }
 }
 

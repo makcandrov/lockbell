@@ -51,6 +51,9 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
 - A reader registers with the bell *before* it acquires, so a reader still waiting on the lock already counts as active. The departing last holder therefore defers the flush to it, and a queued callback waits out that reader's whole hold rather than firing the moment the lock next goes free.
 - Callbacks must be `FnOnce() + Send + 'static`.
 - A panicking callback does not prevent subsequent callbacks from running.
+- Suppressed panic payloads are dropped with panic containment. If a payload's
+  destructor itself panics, that new panic payload is leaked to avoid recursive
+  panics or an abort during unwinding.
 - `try_write_or` is not wait-free despite the name: it waits out a concurrent
   flush before deciding, so that a callback can never land in a batch that has
   already been taken. It never waits on the protected data.
@@ -69,7 +72,7 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
 
 ```toml
 [dependencies]
-lockbell = "0.2"
+lockbell = "0.3"
 ```
 
 ## Features

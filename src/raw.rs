@@ -20,11 +20,6 @@ use crate::tests::hooks;
 /// `force_unlock_write` release a lock, so they run queued callbacks — and can
 /// therefore block and panic.
 ///
-/// Worse, `RwLockWriteGuard::unlocked` and its relatives release *before*
-/// installing the guard that re-acquires. A callback panicking there unwinds
-/// past that guard and leaves a live guard holding no lock, which is unsound.
-/// Do not combine them with callbacks that can panic.
-///
 /// # Requirements on `R`
 ///
 /// [`RawRwLock`] alone is not enough. Substituting your own `R` also means:
@@ -40,24 +35,24 @@ use crate::tests::hooks;
 ///   `locking` and resolving it, and a concurrent release sits in that window
 ///   waiting for `locking` to reach zero while still holding the lock. Blocking
 ///   there stalls every drain and every other `try_write_or`.
-/// - **[`GuardMarker`] is `R`'s.** A `GuardSend` lock yields `Send` guards, so
-///   the release — and with it the whole callback batch — can run on a thread
-///   that never acquired.
+/// - **[`SharedGuard`] and [`ExclusiveGuard`] are `R`'s.** A lock whose guard
+///   state is `Send` yields `Send` guards, so the release — and with it the
+///   whole callback batch — can run on a thread that never acquired.
 ///
 /// [`parking_lot::RawRwLock`] satisfies all four.
 ///
 /// # Extending it
 ///
-/// Do **not** implement [`RawRwLockFair`], [`RawRwLockDowngrade`],
-/// [`RawRwLockRecursive`] or [`RawRwLockUpgrade`] by plain delegation: each
-/// bypasses [`lock_shared`]/[`unlock_shared`], so `unlock_shared_fair` would
-/// leak a reader and `unlock_exclusive_fair` would skip the drain.
+/// Do **not** implement [`RawRwLockFair`], [`RawRwLockDowngrade`] or
+/// [`RawRwLockUpgrade`] by plain delegation: each bypasses
+/// [`lock_shared`]/[`unlock_shared`], so `unlock_shared_fair` would leak a
+/// reader and `unlock_exclusive_fair` would skip the drain.
 ///
 /// [`RawRwLockFair`]: parking_lot::lock_api::RawRwLockFair
 /// [`RawRwLockDowngrade`]: parking_lot::lock_api::RawRwLockDowngrade
-/// [`RawRwLockRecursive`]: parking_lot::lock_api::RawRwLockRecursive
 /// [`RawRwLockUpgrade`]: parking_lot::lock_api::RawRwLockUpgrade
-/// [`GuardMarker`]: parking_lot::lock_api::RawRwLock::GuardMarker
+/// [`SharedGuard`]: parking_lot::lock_api::RawRwLock::SharedGuard
+/// [`ExclusiveGuard`]: parking_lot::lock_api::RawRwLock::ExclusiveGuard
 /// [`lock_shared`]: parking_lot::lock_api::RawRwLock::lock_shared
 /// [`try_lock_shared`]: parking_lot::lock_api::RawRwLock::try_lock_shared
 /// [`unlock_shared`]: parking_lot::lock_api::RawRwLock::unlock_shared
@@ -84,35 +79,34 @@ impl<R: RawRwLock> Debug for RawRwLockBell<R> {
 }
 
 // SAFETY: every method forwards its locking obligation to `self.raw`. The bell
-// bookkeeping never grants or releases access to the protected data.
+// bookkeeping never grants or releases access to the protected data. Unlocks
+// unwind only from callbacks, after `self.raw` has released, as the trait allows.
 unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
     const INIT: Self = Self {
         raw: <R as RawRwLock>::INIT,
         state: LockState::NEW,
     };
 
-    type GuardMarker = <R as RawRwLock>::GuardMarker;
+    type SharedGuard = <R as RawRwLock>::SharedGuard;
+    type ExclusiveGuard = <R as RawRwLock>::ExclusiveGuard;
 
-    fn lock_shared(&self) {
+    fn lock_shared(&self) -> Self::SharedGuard {
         // Counted before acquiring, so no window exists in which we hold the
         // lock uncounted and another reader's release mistakes itself for the
         // last one. Counting a waiter early only ever defers a drain to us.
         self.state.inner.lock().readers += 1;
-        self.raw.lock_shared();
+        self.raw.lock_shared()
     }
 
-    fn try_lock_shared(&self) -> bool {
+    fn try_lock_shared(&self) -> Option<Self::SharedGuard> {
         // Non-blocking, so the whole thing fits under the state mutex.
         let mut inner = self.state.inner.lock();
-        if self.raw.try_lock_shared() {
-            inner.readers += 1;
-            true
-        } else {
-            false
-        }
+        let guard = self.raw.try_lock_shared()?;
+        inner.readers += 1;
+        Some(guard)
     }
 
-    unsafe fn unlock_shared(&self) {
+    unsafe fn unlock_shared(&self, guard: Self::SharedGuard) {
         // Bookkeeping before the release, as in `unlock_exclusive`. Releasing
         // first would let another thread take the lock while `readers` still
         // reads non-zero, and our batch could then sweep up callbacks that lost
@@ -142,7 +136,7 @@ unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
             // we found empty can be filled inside it.
             //
             // SAFETY: forwarded from this method's own contract.
-            unsafe { self.raw.unlock_shared() };
+            unsafe { self.raw.unlock_shared(guard) };
             drop(inner);
             return;
         }
@@ -164,20 +158,20 @@ unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
         hooks::run(hooks::HookPoint::ReadGuardBeforeRawUnlock);
 
         // SAFETY: forwarded from this method's own contract.
-        unsafe { self.raw.unlock_shared() };
+        unsafe { self.raw.unlock_shared(guard) };
 
         drain_and_run(&self.state, callbacks);
     }
 
-    fn lock_exclusive(&self) {
-        self.raw.lock_exclusive();
+    fn lock_exclusive(&self) -> Self::ExclusiveGuard {
+        self.raw.lock_exclusive()
     }
 
-    fn try_lock_exclusive(&self) -> bool {
+    fn try_lock_exclusive(&self) -> Option<Self::ExclusiveGuard> {
         self.raw.try_lock_exclusive()
     }
 
-    unsafe fn unlock_exclusive(&self) {
+    unsafe fn unlock_exclusive(&self, guard: Self::ExclusiveGuard) {
         #[cfg(test)]
         hooks::run(hooks::HookPoint::WriteGuardBeforeDrop);
 
@@ -203,7 +197,7 @@ unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
             // fail against us and queue with nobody left to ring it.
             //
             // SAFETY: forwarded from this method's own contract.
-            unsafe { self.raw.unlock_exclusive() };
+            unsafe { self.raw.unlock_exclusive(guard) };
             drop(inner);
             return;
         }
@@ -224,12 +218,11 @@ unsafe impl<R: RawRwLock> RawRwLock for RawRwLockBell<R> {
         hooks::run(hooks::HookPoint::WriteGuardBeforeRawUnlock);
 
         // SAFETY: forwarded from this method's own contract.
-        unsafe { self.raw.unlock_exclusive() };
+        unsafe { self.raw.unlock_exclusive(guard) };
 
         drain_and_run(&self.state, callbacks);
     }
 
-    // The provided impls probe by acquiring and releasing, which would ring.
     fn is_locked(&self) -> bool {
         self.raw.is_locked()
     }
@@ -243,23 +236,26 @@ impl<R: RawRwLock> RawRwLockBell<R> {
     /// Attempts to acquire the exclusive lock; on failure, queues `callback`.
     ///
     /// The raw counterpart of
-    /// [`RwLockBell::try_write_or`](crate::RwLockBell::try_write_or). On `true`
-    /// the caller owns the exclusive lock and must release it exactly once, and
-    /// `callback` is discarded.
+    /// [`RwLockBell::try_write_or`](crate::RwLockBell::try_write_or). On
+    /// `Some(state)` the caller owns the exclusive lock and must release it
+    /// exactly once with `state`, and `callback` is discarded.
     ///
     /// Not wait-free: it waits out any concurrent flush. Unlike
     /// [`try_lock_exclusive_or_else`], no user code runs inside that window.
     ///
     /// # Discarding the callback
     ///
-    /// On `true`, `callback` is dropped here — **with the lock held**, before
+    /// On success, `callback` is dropped here — **with the lock held**, before
     /// the caller can build a guard. So its captures' destructors must not
     /// touch this lock: doing so deadlocks. A destructor that panics is
     /// survivable, though — the lock is released before the panic propagates,
     /// so it is not stranded.
     ///
     /// [`try_lock_exclusive_or_else`]: Self::try_lock_exclusive_or_else
-    pub fn try_lock_exclusive_or<Callback>(&self, callback: Callback) -> bool
+    pub fn try_lock_exclusive_or<Callback>(
+        &self,
+        callback: Callback,
+    ) -> Option<<Self as RawRwLock>::ExclusiveGuard>
     where
         Callback: FnOnce() + Send + 'static,
     {
@@ -278,22 +274,22 @@ impl<R: RawRwLock> RawRwLockBell<R> {
         #[cfg(test)]
         hooks::run(hooks::HookPoint::TryWriteOrBeforeAcquire);
 
-        if self.raw.try_lock_exclusive() {
+        if let Some(guard) = self.raw.try_lock_exclusive() {
             self.state.decrement_locking();
 
             // The discarded `callback` drops here, holding the lock with no
             // guard yet built to release it: a panicking destructor would
             // strand it for good. Release on the way out, exactly as the guard
             // the caller is about to build would have.
-            //
+            let mut guard = Some(guard);
             // SAFETY: acquired just above and not yet handed to a guard, so we
             // own the release. Scoped to this branch: on the other one we hold
             // nothing, and releasing there would unlock a lock we never took.
             catch_panic(
                 move || drop(callback),
-                || unsafe { <Self as RawRwLock>::unlock_exclusive(self) },
+                || unsafe { <Self as RawRwLock>::unlock_exclusive(self, guard.take().unwrap()) },
             );
-            true
+            guard
         } else {
             // Boxed only here, so an uncontended call never allocates. Nothing
             // between the failed acquire and the push can panic, so unlike
@@ -303,13 +299,13 @@ impl<R: RawRwLock> RawRwLockBell<R> {
             let mut inner = self.state.inner.lock();
             inner.callbacks.push(cb);
             inner.decrement_locking(&self.state.locking_zero);
-            false
+            None
         }
     }
 
     /// Like [`try_lock_exclusive_or`], but builds the callback lazily:
-    /// `factory` runs only on contention. On `true` the caller owns the
-    /// exclusive lock and must release it exactly once.
+    /// `factory` runs only on contention. On `Some(state)` the caller owns the
+    /// exclusive lock and must release it exactly once with `state`.
     ///
     /// The raw counterpart of
     /// [`RwLockBell::try_write_or_else`](crate::RwLockBell::try_write_or_else).
@@ -317,13 +313,17 @@ impl<R: RawRwLock> RawRwLockBell<R> {
     /// Same rules as there: `factory` runs inside the window a concurrent
     /// unlock waits on, so it must not touch this lock and must not block.
     ///
-    /// On `true` the unused `factory` is discarded under the same rule as the
+    /// On success the unused `factory` is discarded under the same rule as the
     /// callback in [`try_lock_exclusive_or`]: it drops with the lock held, so
     /// its captures' destructors must not touch this lock.
     ///
     /// [`try_lock_exclusive_or`]: Self::try_lock_exclusive_or
-    pub fn try_lock_exclusive_or_else<Callback>(&self, factory: impl FnOnce() -> Callback) -> bool
+    pub fn try_lock_exclusive_or_else<Callback, Factory>(
+        &self,
+        factory: Factory,
+    ) -> Option<<Self as RawRwLock>::ExclusiveGuard>
     where
+        Factory: FnOnce() -> Callback,
         Callback: FnOnce() + Send + 'static,
     {
         // Check and bump under one lock, so the `draining` view can't go stale.
@@ -341,18 +341,18 @@ impl<R: RawRwLock> RawRwLockBell<R> {
         #[cfg(test)]
         hooks::run(hooks::HookPoint::TryWriteOrBeforeAcquire);
 
-        if self.raw.try_lock_exclusive() {
+        if let Some(guard) = self.raw.try_lock_exclusive() {
             self.state.decrement_locking();
 
             // The unused `factory` drops here under the same rule as the
             // callback in `try_lock_exclusive_or`.
-            //
+            let mut guard = Some(guard);
             // SAFETY: acquired just above and not yet handed to a guard.
             catch_panic(
                 move || drop(factory),
-                || unsafe { <Self as RawRwLock>::unlock_exclusive(self) },
+                || unsafe { <Self as RawRwLock>::unlock_exclusive(self, guard.take().unwrap()) },
             );
-            true
+            guard
         } else {
             // Decrement even if the factory panics, or drainers wait forever.
             let cb = catch_panic(factory, || self.state.decrement_locking());
@@ -361,7 +361,7 @@ impl<R: RawRwLock> RawRwLockBell<R> {
             let mut inner = self.state.inner.lock();
             inner.callbacks.push(cb);
             inner.decrement_locking(&self.state.locking_zero);
-            false
+            None
         }
     }
 }
