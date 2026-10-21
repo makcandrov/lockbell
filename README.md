@@ -68,18 +68,11 @@ When [`try_write_or`] fails, the callback is queued. Queued callbacks are flushe
   concurrent factory, and panic with a callback's payload. Do not format a
   lock from a place that cannot take those.
 
-The low-level `RawRwLockBell::try_lock_exclusive_or` and
-`try_lock_exclusive_or_else` methods are `unsafe`: callers must ensure that
-releases tolerate a callback unwinding after the underlying lock is released.
-In particular, `lock_api` guard temporary-unlock operations must not be used
-while registered callbacks can run. `RwLockBell` enforces this restriction by
-keeping those operations private, so its callback methods remain safe.
-
 ## Installation
 
 ```toml
 [dependencies]
-lockbell = "0.2"
+lockbell = "0.3"
 ```
 
 ## Features

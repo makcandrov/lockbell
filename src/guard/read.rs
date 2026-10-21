@@ -95,7 +95,7 @@ impl<'a, T: ?Sized> MappedRwLockBellReadGuard<'a, T> {
     where
         F: FnOnce(&T) -> Result<&U, E>,
     {
-        match lock_api::MappedRwLockReadGuard::try_map_or_else(s.0, f) {
+        match lock_api::MappedRwLockReadGuard::try_map_or_err(s.0, f) {
             Ok(mapped) => Ok(MappedRwLockBellReadGuard(mapped)),
             Err((guard, err)) => Err((Self(guard), err)),
         }
